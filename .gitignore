@@ -1,0 +1,10 @@
+.DS_Store
+
+# build artifacts
+*.out
+a.out
+
+# local test executables (keep test_*.cpp)
+*/test_*
+!*/test_*.cpp
+
