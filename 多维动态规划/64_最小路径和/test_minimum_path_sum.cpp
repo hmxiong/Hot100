@@ -15,7 +15,7 @@ public:
         dp[0] = grid[0][0];
         for (int j = 1; j < n; ++j) dp[j] = dp[j - 1] + grid[0][j];
         for (int i = 1; i < m; ++i) {
-            dp[0] += grid[i][0];
+            dp[0] += grid[i][0]; // 注意这里要累加，而不是赋值
             for (int j = 1; j < n; ++j) dp[j] = min(dp[j], dp[j - 1]) + grid[i][j];
         }
         return dp[n - 1];

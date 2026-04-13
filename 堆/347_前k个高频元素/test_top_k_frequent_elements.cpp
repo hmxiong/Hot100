@@ -19,7 +19,7 @@ public:
         for (auto& e : cnt) {
             int val = e.first;
             int c = e.second;
-            pq.push({c, val});
+            pq.push({c, val}); //构建小根堆
             if ((int)pq.size() > k) pq.pop();
         }
         vector<int> res;
