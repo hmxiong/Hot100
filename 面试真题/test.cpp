@@ -104,3 +104,22 @@ int main() {
     }
     return 0;
 }
+
+
+int findPeak(vecotr<int>& num){
+    int n = num.size();
+    int l = 0;
+    int r = n - 1;
+    int mid_idx = (l + r)/2;
+    for (int i = 0; i< n;i++){
+        int mid = num[mid_idx];
+        if(mid < num[i]){
+            l  = mid + 1;
+        }
+        else{
+            r = mid;
+        }
+    }
+    return mid_idx
+    
+}
