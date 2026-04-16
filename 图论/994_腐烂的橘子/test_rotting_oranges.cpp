@@ -11,6 +11,7 @@ public:
     int orangesRotting(vector<vector<int>>& grid) {
         int m = (int)grid.size();
         int n = (int)grid[0].size();
+
         queue<pair<int, int>> q;
         int fresh = 0;
         for (int i = 0; i < m; ++i) {
@@ -18,12 +19,16 @@ public:
                 if (grid[i][j] == 2) q.push({i, j});
                 else if (grid[i][j] == 1) fresh++;
             }
-        }
+        }//首先找到所有腐烂的橘子，将它们加入队列
+
         if (fresh == 0) return 0;
         if (q.empty()) return -1;
         int minutes = 0;
         const int di[4] = {1, -1, 0, 0};
         const int dj[4] = {0, 0, 1, -1};
+
+        //以腐烂的橘子为起点，进行广度优先搜索
+        //为什么选择BFS？因为每次遍历寻找的是相邻的点，所以符合层序遍历的定义
         while (!q.empty()) {
             int sz = (int)q.size();
             for (int t = 0; t < sz; ++t) {
