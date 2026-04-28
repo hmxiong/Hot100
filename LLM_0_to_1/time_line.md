@@ -1,0 +1,2 @@
+完成minimind3和minimind3-moe模型的基础训练
+在minimind的训练代码基础上叠加tinyllama的训练过程，尝试第一次将模型参数和训练数据扩充到0.5B的参数级别
