@@ -119,6 +119,35 @@ def build_full_state_dict_for_saving(model, accelerator):
             cpu_state_dict[k] = full_v.detach().cpu()
     return cpu_state_dict
 
+def _save_loss_visualization(loss_history, args, block_idx, stage_tag="stage2_accelerate"):
+    if not loss_history:
+        return
+    out_dir = getattr(args, "loss_vis_dir", os.path.join("log", "loss_vis"))
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = f"{stage_tag}_block_{block_idx}"
+    csv_path = os.path.join(out_dir, f"{base_name}.csv")
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("iter,loss\n")
+        for i, loss in enumerate(loss_history):
+            f.write(f"{i},{loss}\n")
+
+    try:
+        import matplotlib.pyplot as plt
+
+        png_path = os.path.join(out_dir, f"{base_name}.png")
+        plt.figure(figsize=(8, 4))
+        plt.plot(range(len(loss_history)), loss_history, marker="o", linewidth=1.5, markersize=3)
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.title(f"Training Loss ({stage_tag}, block={block_idx})")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(png_path, dpi=150)
+        plt.close()
+        print(f"[loss_vis] saved csv={csv_path} png={png_path}")
+    except Exception as e:
+        print(f"[loss_vis] matplotlib unavailable, only csv saved: {csv_path} ({e})")
+
 
 def main():
     parser = argparse.ArgumentParser()
