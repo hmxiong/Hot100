@@ -1,0 +1,27 @@
+[transformers] Qwen3_5ForCausalLM LOAD REPORT from: ./stage2_out
+Key                                                         | Status     |                                                                                            
+------------------------------------------------------------+------------+--------------------------------------------------------------------------------------------
+model.layers.{0...23}.mlp.perm_down.scale                   | UNEXPECTED |                                                                                            
+model.layers.{0...23}.mlp.perm_up.weight                    | UNEXPECTED |                                                                                            
+model.layers.{0...23}.mlp.perm_up.scale                     | UNEXPECTED |                                                                                            
+model.layers.{0...23}.mlp.perm_down.weight                  | UNEXPECTED |                                                                                            
+model.layers.{0...23}.mlp.up_proj.weight                    | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([3584, 1024])      
+model.layers.{4...22}.linear_attn.dt_bias                   | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([16])              
+model.layers.{3, 7, 11, 15, 19, 23}.self_attn.o_proj.weight | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([1024, 2048])      
+model.layers.{4...22}.linear_attn.norm.weight               | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([128])             
+model.layers.{0...23}.mlp.gate_proj.weight                  | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([3584, 1024])      
+model.layers.{0...22}.linear_attn.in_proj_z.weight          | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([2048, 1024])      
+model.layers.{0...22}.linear_attn.in_proj_a.weight          | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([16, 1024])        
+model.layers.{0...22}.linear_attn.conv1d.weight             | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([24576]) vs model:torch.Size([6144, 1, 4])  
+model.layers.{2...23}.input_layernorm.weight                | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([1024])            
+model.layers.{0...23}.mlp.down_proj.weight                  | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([1024, 3584])      
+model.layers.{2...23}.post_attention_layernorm.weight       | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([1024])            
+model.layers.{0...22}.linear_attn.out_proj.weight           | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([1024, 2048])      
+model.layers.{4...22}.linear_attn.A_log                     | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([16])              
+model.layers.{0...22}.linear_attn.in_proj_b.weight          | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([16, 1024])        
+model.layers.{3, 7, 11, 15, 19, 23}.self_attn.k_norm.weight | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([256])             
+model.layers.{0...22}.linear_attn.in_proj_qkv.weight        | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([6291456]) vs model:torch.Size([6144, 1024])
+model.layers.{3, 7, 11, 15, 19, 23}.self_attn.k_proj.weight | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([512, 1024])       
+model.layers.{3, 7, 11, 15, 19, 23}.self_attn.q_proj.weight | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([4096, 1024])      
+model.layers.{3, 7, 11, 15, 19, 23}.self_attn.v_proj.weight | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([512, 1024])       
+model.layers.{3, 7, 11, 15, 19, 23}.self_attn.q_norm.weight | MISMATCH   | Reinit due to size mismatch - ckpt: torch.Size([0]) vs model:torch.Size([256])             
