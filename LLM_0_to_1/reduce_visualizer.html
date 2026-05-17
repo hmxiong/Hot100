@@ -1,0 +1,1080 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reduce 可视化（warp shuffle + shared + atomicAdd）</title>
+    <style>
+      :root {
+        --bg: #0b1020;
+        --panel: #111a33;
+        --panel2: #0f1730;
+        --text: #e8ecff;
+        --muted: rgba(232, 236, 255, 0.7);
+        --line: rgba(232, 236, 255, 0.12);
+        --accent: #8be9fd;
+        --good: #50fa7b;
+        --warn: #ffb86c;
+        --bad: #ff5555;
+      }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+        background: radial-gradient(1400px 900px at 20% 0%, #111a33 0%, var(--bg) 60%, #070a14 100%);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px 16px 28px;
+      }
+      h1 {
+        font-size: 18px;
+        font-weight: 650;
+        margin: 0 0 10px;
+        letter-spacing: 0.2px;
+      }
+      .sub {
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 340px 1fr;
+        gap: 14px;
+      }
+      .panel {
+        background: linear-gradient(180deg, rgba(17, 26, 51, 0.86), rgba(15, 23, 48, 0.86));
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 12px 12px 14px;
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.36);
+      }
+      .panel h2 {
+        font-size: 13px;
+        font-weight: 650;
+        margin: 0 0 10px;
+        color: rgba(232, 236, 255, 0.92);
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin: 0 0 6px;
+      }
+      input[type="number"],
+      select {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: rgba(8, 12, 25, 0.66);
+        color: var(--text);
+        padding: 8px 10px;
+        outline: none;
+        font-size: 13px;
+      }
+      input[type="range"] {
+        width: 100%;
+      }
+      .btns {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 10px;
+        margin-top: 10px;
+      }
+      button {
+        border: 1px solid var(--line);
+        background: rgba(8, 12, 25, 0.66);
+        color: var(--text);
+        padding: 10px 10px;
+        border-radius: 12px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      button:hover {
+        border-color: rgba(139, 233, 253, 0.4);
+      }
+      button.primary {
+        background: rgba(139, 233, 253, 0.14);
+        border-color: rgba(139, 233, 253, 0.32);
+      }
+      .status {
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.5;
+        min-height: 36px;
+      }
+      .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(8, 12, 25, 0.66);
+        font-size: 12px;
+        color: rgba(232, 236, 255, 0.9);
+      }
+      .badge.good { border-color: rgba(80, 250, 123, 0.35); background: rgba(80, 250, 123, 0.10); }
+      .badge.warn { border-color: rgba(255, 184, 108, 0.45); background: rgba(255, 184, 108, 0.10); }
+      .badge.bad { border-color: rgba(255, 85, 85, 0.45); background: rgba(255, 85, 85, 0.10); }
+      .vizTop {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 10px;
+      }
+      .stepper {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .stepText {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
+      .vizGrid {
+        display: grid;
+        grid-template-columns: 1.15fr 0.85fr;
+        gap: 12px;
+      }
+      .vizWrap {
+        position: relative;
+      }
+      .wires {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 5;
+      }
+      .wire {
+        fill: none;
+        stroke-width: 2;
+        opacity: 0.92;
+      }
+      .wire.shfl { stroke: rgba(139, 233, 253, 0.9); }
+      .wire.smem { stroke: rgba(255, 184, 108, 0.9); }
+      .wire.atomic { stroke: rgba(80, 250, 123, 0.9); }
+      .wire.fade { opacity: 0.32; }
+      .macro {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(8, 12, 25, 0.42);
+        padding: 10px;
+        margin-bottom: 12px;
+      }
+      .macroSvg {
+        width: 100%;
+        height: 210px;
+        display: block;
+      }
+      .mNode {
+        fill: rgba(15, 23, 48, 0.72);
+        stroke: rgba(232, 236, 255, 0.18);
+        stroke-width: 1;
+      }
+      .mNode.active {
+        stroke: rgba(139, 233, 253, 0.75);
+        stroke-width: 2;
+        filter: drop-shadow(0 0 10px rgba(139, 233, 253, 0.12));
+      }
+      .mTxt {
+        font-size: 12px;
+        fill: rgba(232, 236, 255, 0.92);
+      }
+      .mSub {
+        font-size: 11px;
+        fill: rgba(232, 236, 255, 0.65);
+      }
+      .mEdge {
+        fill: none;
+        stroke: rgba(232, 236, 255, 0.22);
+        stroke-width: 2;
+        marker-end: url(#mArrow);
+      }
+      .mEdge.active {
+        stroke: rgba(80, 250, 123, 0.85);
+        stroke-dasharray: 8 8;
+        animation: mdash 0.9s linear infinite;
+      }
+      .mEdge.shfl.active {
+        stroke: rgba(139, 233, 253, 0.9);
+      }
+      .mEdge.smem.active {
+        stroke: rgba(255, 184, 108, 0.9);
+      }
+      .mEdge.atomic.active {
+        stroke: rgba(80, 250, 123, 0.9);
+      }
+      .mNode.pulse {
+        animation: mpulse 0.8s ease-in-out infinite;
+      }
+      @keyframes mdash {
+        from { stroke-dashoffset: 0; }
+        to { stroke-dashoffset: -16; }
+      }
+      @keyframes mpulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.62; }
+        100% { opacity: 1; }
+      }
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 10px;
+        background: rgba(8, 12, 25, 0.42);
+      }
+      .cardTitle {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
+      .cardTitle h3 {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .hint {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .threadGrid {
+        display: grid;
+        gap: 6px;
+      }
+      .threadCell {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 8px 10px;
+        display: grid;
+        grid-template-columns: 74px 74px 1fr;
+        align-items: center;
+        gap: 10px;
+        background: rgba(15, 23, 48, 0.65);
+      }
+      .threadCell.w0 { border-color: rgba(139, 233, 253, 0.22); }
+      .threadCell.w1 { border-color: rgba(189, 147, 249, 0.22); }
+      .threadCell.w2 { border-color: rgba(255, 184, 108, 0.22); }
+      .threadCell.w3 { border-color: rgba(80, 250, 123, 0.22); }
+      .tMeta { font-size: 12px; color: rgba(232, 236, 255, 0.88); }
+      .tMeta .muted { color: var(--muted); font-weight: 500; }
+      .tVal { font-size: 13px; font-weight: 650; }
+      .tVal .muted { color: var(--muted); font-weight: 500; }
+      .mark {
+        outline: 2px solid rgba(139, 233, 253, 0.65);
+        box-shadow: 0 0 0 4px rgba(139, 233, 253, 0.08);
+      }
+      .arrow {
+        margin-top: 10px;
+        border: 1px dashed rgba(232, 236, 255, 0.22);
+        border-radius: 14px;
+        padding: 10px;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+      .smemGrid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 6px;
+      }
+      .smemCell {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 10px;
+        background: rgba(15, 23, 48, 0.65);
+      }
+      .smemCell .k { font-size: 12px; color: var(--muted); }
+      .smemCell .v { font-size: 13px; font-weight: 650; margin-top: 6px; }
+      .smemCell.pick { outline: 2px solid rgba(255, 184, 108, 0.55); box-shadow: 0 0 0 4px rgba(255, 184, 108, 0.08); }
+      .smPanel {
+        margin-top: 12px;
+      }
+      .sms {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+      }
+      .sm {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 10px;
+        background: rgba(15, 23, 48, 0.65);
+      }
+      .sm .t { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+      .sm .b {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+      }
+      .blk {
+        border: 1px solid rgba(232, 236, 255, 0.14);
+        border-radius: 12px;
+        padding: 8px;
+        font-size: 12px;
+        color: rgba(232, 236, 255, 0.86);
+        background: rgba(8, 12, 25, 0.46);
+      }
+      .blk.active {
+        outline: 2px solid rgba(80, 250, 123, 0.55);
+        box-shadow: 0 0 0 4px rgba(80, 250, 123, 0.08);
+      }
+      .foot {
+        margin-top: 12px;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      @media (max-width: 980px) {
+        .grid { grid-template-columns: 1fr; }
+        .vizGrid { grid-template-columns: 1fr; }
+        .sms { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Reduce 可视化：warp shuffle → shared memory → warp0 二次归约 → atomicAdd</h1>
+      <p class="sub">
+        这是对 <span class="mono">reduce.cu</span> 中 <span class="mono">recude_v3</span> 的抽象可视化：展示一个 block 内线程如何通过 <span class="mono">__shfl_down_sync</span> 做 warp 归约、lane0 写入 shared、warp0 读取 shared 再归约，最后对全局输出做 <span class="mono">atomicAdd</span>。硬件层面（例如 5090）实际的 SM 数量、调度、吞吐由架构决定，这里用“warp/SM/内存层次”做可交互的近似解释。
+      </p>
+      <div class="grid">
+        <div class="panel">
+          <h2>配置</h2>
+          <div class="row">
+            <div>
+              <label for="N">N（输入长度）</label>
+              <input id="N" type="number" min="1" step="1" value="32" />
+            </div>
+            <div>
+              <label for="blockDim">BLOCK_SIZE（blockDim.x）</label>
+              <input id="blockDim" type="number" min="4" step="1" value="16" />
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>Warp Size（NVIDIA 固定为 32）</label>
+              <input type="number" value="32" disabled />
+            </div>
+            <div>
+              <label for="smCount">SM 数量（可视化用）</label>
+              <input id="smCount" type="number" min="1" step="1" value="8" />
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label for="blockPick">观察 blockIdx.x</label>
+              <input id="blockPick" type="number" min="0" step="1" value="0" />
+            </div>
+            <div>
+              <label for="pattern">输入数据模式</label>
+              <select id="pattern">
+                <option value="seq">递增：input[i] = i</option>
+                <option value="ones">全 1</option>
+                <option value="rand">随机（[-1, 1]）</option>
+              </select>
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label for="seed">随机种子（rand 模式）</label>
+              <input id="seed" type="number" step="1" value="7" />
+            </div>
+            <div>
+              <label for="speed">播放速度</label>
+              <input id="speed" type="range" min="0.25" max="3" step="0.25" value="1" />
+            </div>
+          </div>
+          <div class="btns">
+            <button class="primary" id="regen">生成并模拟</button>
+            <button id="play">播放</button>
+            <button id="reset">重置</button>
+          </div>
+          <div class="btns" style="grid-template-columns: 1fr 1fr 1fr 1fr; margin-top: 10px;">
+            <button id="prev">上一步</button>
+            <button id="next">下一步</button>
+            <button id="toStart">到开头</button>
+            <button id="toEnd">到结尾</button>
+          </div>
+          <div class="status" id="status"></div>
+          <div class="foot">
+            <div style="margin-bottom: 6px;">
+              <span class="badge good">已对齐</span>
+              可视化现在按你修正后的 kernel：真实 warp（32 lanes）+ <span class="mono">__activemask()</span> + shared 写后 <span class="mono">__syncthreads()</span> + warp0 分批读取 shared 做二次归约。
+            </div>
+            <div>
+              <span class="badge">提示</span>
+              如果设置的 <span class="mono">BLOCK_SIZE</span> 不是 32 的倍数，会出现“尾部 partial warp”，页面会用 active mask 的逻辑展示它如何避免读到无效 lane 的数据。
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="vizTop">
+            <div>
+              <h2 style="margin: 0 0 4px;">执行过程</h2>
+              <div class="stepText" id="stepText"></div>
+            </div>
+            <div class="stepper">
+              <span class="badge good" id="outBadge">output = 0</span>
+              <span class="badge" id="blkBadge">block 0</span>
+              <span class="badge" id="sumBadge">block_sum = 0</span>
+            </div>
+          </div>
+          <div class="macro">
+            <div class="cardTitle" style="margin-bottom: 8px;">
+              <h3>宏观数据流（5090 类 NVIDIA GPU）</h3>
+              <div class="hint" id="macroHint">按当前步骤高亮：load / shuffle / shared / atomic</div>
+            </div>
+            <svg class="macroSvg" id="macroSvg" viewBox="0 0 980 210" preserveAspectRatio="none" aria-hidden="true"></svg>
+          </div>
+          <div class="vizWrap" id="vizWrap">
+            <svg class="wires" id="wires" aria-hidden="true"></svg>
+            <div class="vizGrid" id="vizGrid">
+              <div class="card">
+                <div class="cardTitle">
+                  <h3>线程（一个 block 内）</h3>
+                  <div class="hint">显示每个 thread 的 (warp, lane, idx, val)</div>
+                </div>
+                <div id="threadGrid" class="threadGrid"></div>
+                <div class="arrow" id="opDesc"></div>
+              </div>
+              <div class="card">
+                <div class="cardTitle">
+                  <h3>Shared Memory</h3>
+                  <div class="hint mono">smem[warp_id]</div>
+                </div>
+                <div id="smemGrid" class="smemGrid"></div>
+                <div class="smPanel">
+                  <div class="cardTitle" style="margin-top: 10px;">
+                    <h3>SM 调度（抽象）</h3>
+                    <div class="hint">block 运行在哪个 SM</div>
+                  </div>
+                  <div id="sms" class="sms"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+      const fmt = (x) => {
+        if (!Number.isFinite(x)) return String(x);
+        const abs = Math.abs(x);
+        if (abs === 0) return "0";
+        if (abs >= 1000) return x.toFixed(0);
+        if (abs >= 10) return x.toFixed(3);
+        return x.toFixed(5);
+      };
+      function mulberry32(seed) {
+        let t = seed >>> 0;
+        return () => {
+          t += 0x6D2B79F5;
+          let r = Math.imul(t ^ (t >>> 15), 1 | t);
+          r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+          return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+      function computeBlockToSm(gridSize, smCount) {
+        const sms = Array.from({ length: smCount }, () => []);
+        for (let b = 0; b < gridSize; b++) {
+          sms[b % smCount].push(b);
+        }
+        return sms;
+      }
+      function buildInput(N, pattern, seed) {
+        const rng = mulberry32(seed);
+        const arr = new Array(N);
+        for (let i = 0; i < N; i++) {
+          if (pattern === "seq") arr[i] = i;
+          else if (pattern === "ones") arr[i] = 1;
+          else arr[i] = (rng() * 2 - 1);
+        }
+        return arr;
+      }
+      function simulateAll({ input, N, blockDim }) {
+        const WARP_SIZE = 32;
+        const gridSize = Math.ceil(N / blockDim);
+        const blocks = [];
+        let globalOut = 0;
+        for (let b = 0; b < gridSize; b++) {
+          const base = b * blockDim;
+          const warpNum = Math.ceil(blockDim / WARP_SIZE);
+          const threads = [];
+          for (let t = 0; t < blockDim; t++) {
+            const idx = base + t;
+            const warpId = Math.floor(t / WARP_SIZE);
+            const laneId = t % WARP_SIZE;
+            const val = idx < N ? input[idx] : 0;
+            threads.push({ t, idx, warpId, laneId, val });
+          }
+          const smem = new Array(blockDim).fill(0);
+          const states = [];
+          const pushState = (stage, detail, highlights = {}) => {
+            states.push({
+              stage,
+              detail,
+              threads: threads.map((x) => ({ ...x })),
+              smem: smem.slice(),
+              highlights
+            });
+          };
+          pushState("load", "每个线程从 global memory 读取 input[idx]（越界则为 0）", {});
+          let offset = WARP_SIZE >> 1;
+          while (offset > 0) {
+            const adds = [];
+            for (let w = 0; w < warpNum; w++) {
+              const warpBase = w * WARP_SIZE;
+              const active = Math.min(WARP_SIZE, blockDim - warpBase);
+              for (let lane = 0; lane < active; lane++) {
+                const fromLane = lane + offset;
+                if (fromLane < active) {
+                  const toT = warpBase + lane;
+                  const fromT = warpBase + fromLane;
+                  threads[toT].val += threads[fromT].val;
+                  adds.push({ toT, fromT });
+                }
+              }
+            }
+            pushState("shfl", `warp 内 shuffle 归约（offset=${offset}）：仅 active lanes 参与累加`, { adds });
+            offset >>= 1;
+          }
+          const writes = [];
+          for (let w = 0; w < warpNum; w++) {
+            const lane0T = w * WARP_SIZE + 0;
+            smem[w] = threads[lane0T].val;
+            writes.push({ fromT: lane0T, smemIdx: w });
+          }
+          pushState("smem_write", "每个 warp 的 lane0 写入 shared memory：smem[warp_id] = val", { writes });
+          pushState("barrier", "__syncthreads()：保证所有 warp 的写入对 warp0 可见", {});
+
+          const warp0Active = Math.min(WARP_SIZE, blockDim);
+          let sum = 0;
+          for (let baseSm = 0; baseSm < warpNum; baseSm += WARP_SIZE) {
+            const rem = warpNum - baseSm;
+            const take = rem < WARP_SIZE ? rem : WARP_SIZE;
+
+            const loads = [];
+            for (let lane = 0; lane < warp0Active; lane++) {
+              const v = lane < take ? smem[baseSm + lane] : 0;
+              threads[lane].val = v;
+              if (lane < take) loads.push({ smemIdx: baseSm + lane, lane });
+            }
+            pushState("smem_read", `warp0 读取 shared（base=${baseSm}, take=${take}）：val = (lane < take) ? smem[base+lane] : 0`, { loads });
+
+            offset = WARP_SIZE >> 1;
+            while (offset > 0) {
+              const adds = [];
+              for (let lane = 0; lane < take; lane++) {
+                const fromLane = lane + offset;
+                if (fromLane < take) {
+                  const toT = lane;
+                  const fromT = fromLane;
+                  threads[toT].val += threads[fromT].val;
+                  adds.push({ toT, fromT });
+                }
+              }
+              pushState("shfl2", `warp0 二次归约（base=${baseSm}，offset=${offset}）：仅前 take 个 lanes 参与`, { adds });
+              offset >>= 1;
+            }
+
+            sum += threads[0].val;
+            pushState("sum_accum", `lane0 累加 batch 部分和：sum += v0（当前 sum=${fmt(sum)}）`, { sumAccum: { sum } });
+          }
+
+          const blockSum = sum;
+          globalOut += blockSum;
+          pushState("atomic", "lane0 执行 atomicAdd(output, sum)，把 block 部分和累加到全局 output", { atomic: { blockSum, globalOut } });
+          blocks.push({ b, gridSize, warpNum, states, blockSum });
+        }
+        return { gridSize: Math.ceil(N / blockDim), blocks, finalOut: globalOut };
+      }
+      function validateParams({ N, blockDim, blockPick }) {
+        const notes = [];
+        if (blockDim < 1) notes.push(["bad", "BLOCK_SIZE 需要 ≥ 1"]);
+        if (blockDim > 1024) notes.push(["warn", "BLOCK_SIZE > 1024：典型情况下单个 block 的线程数会受到硬件上限限制"]);
+        if (blockDim % 32 !== 0) notes.push(["warn", "BLOCK_SIZE 不是 32 的倍数：会出现 partial warp（已按 active mask 模拟）"]);
+        const gridSize = Math.ceil(N / blockDim);
+        if (blockPick < 0 || blockPick >= gridSize) notes.push(["warn", `blockIdx.x 越界（grid_size=${gridSize}），已自动 clamp`]);
+        return { notes, gridSize };
+      }
+      function renderSmSchedule(smCount, gridSize, activeBlock) {
+        const sms = computeBlockToSm(gridSize, smCount);
+        const node = $("sms");
+        node.innerHTML = "";
+        for (let i = 0; i < smCount; i++) {
+          const sm = document.createElement("div");
+          sm.className = "sm";
+          const t = document.createElement("div");
+          t.className = "t";
+          t.textContent = `SM ${i}`;
+          const b = document.createElement("div");
+          b.className = "b";
+          for (const blk of sms[i]) {
+            const el = document.createElement("div");
+            el.className = "blk" + (blk === activeBlock ? " active" : "");
+            el.textContent = `block ${blk}`;
+            b.appendChild(el);
+          }
+          if (sms[i].length === 0) {
+            const el = document.createElement("div");
+            el.className = "blk";
+            el.style.opacity = "0.55";
+            el.textContent = "空闲";
+            b.appendChild(el);
+          }
+          sm.appendChild(t);
+          sm.appendChild(b);
+          node.appendChild(sm);
+        }
+      }
+      function wireDefs() {
+        return `
+          <defs>
+            <marker id="arrowShfl" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(139, 233, 253, 0.9)"></path>
+            </marker>
+            <marker id="arrowSmem" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(255, 184, 108, 0.9)"></path>
+            </marker>
+            <marker id="arrowAtomic" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(80, 250, 123, 0.9)"></path>
+            </marker>
+          </defs>
+        `;
+      }
+      function drawWire(svg, rootRect, fromEl, toEl, klass, markerId, bend = 36, fade = false) {
+        if (!fromEl || !toEl) return;
+        const a = fromEl.getBoundingClientRect();
+        const b = toEl.getBoundingClientRect();
+        const x1 = a.left - rootRect.left + a.width / 2;
+        const y1 = a.top - rootRect.top + a.height / 2;
+        const x2 = b.left - rootRect.left + b.width / 2;
+        const y2 = b.top - rootRect.top + b.height / 2;
+        const sgn = x2 >= x1 ? 1 : -1;
+        const dx = Math.min(140, Math.max(28, Math.abs(x2 - x1) * 0.32)) * sgn;
+        const dy = Math.min(120, Math.max(0, Math.abs(y2 - y1) * 0.12));
+        const c1x = x1 + dx;
+        const c1y = y1 - dy;
+        const c2x = x2 - dx;
+        const c2y = y2 + dy;
+        const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        p.setAttribute("d", `M ${x1} ${y1} C ${c1x} ${c1y} ${c2x} ${c2y} ${x2} ${y2}`);
+        p.setAttribute("class", `wire ${klass}${fade ? " fade" : ""}`);
+        p.setAttribute("marker-end", `url(#${markerId})`);
+        svg.appendChild(p);
+      }
+      let wireCtx = null;
+      function renderWires({ stage, highlights }) {
+        const wrap = $("vizWrap");
+        const svg = $("wires");
+        if (!wrap || !svg) return;
+        const rootRect = wrap.getBoundingClientRect();
+        svg.setAttribute("viewBox", `0 0 ${Math.max(1, rootRect.width)} ${Math.max(1, rootRect.height)}`);
+        svg.innerHTML = wireDefs();
+        const threadEl = (t) => wrap.querySelector(`.threadCell[data-t="${t}"]`);
+        const smemEl = (s) => wrap.querySelector(`.smemCell[data-s="${s}"]`);
+        if (stage === "shfl" || stage === "shfl2") {
+          const adds = highlights.adds || [];
+          const max = 24;
+          for (let i = 0; i < adds.length; i++) {
+            const { fromT, toT } = adds[i];
+            drawWire(svg, rootRect, threadEl(fromT), threadEl(toT), "shfl", "arrowShfl", 36, i >= max);
+          }
+        } else if (stage === "smem_write") {
+          const writes = highlights.writes || [];
+          for (const w of writes) {
+            drawWire(svg, rootRect, threadEl(w.fromT), smemEl(w.smemIdx), "smem", "arrowSmem", 44, false);
+          }
+        } else if (stage === "smem_read") {
+          const loads = highlights.loads || [];
+          for (const l of loads) {
+            drawWire(svg, rootRect, smemEl(l.smemIdx), threadEl(l.lane), "smem", "arrowSmem", 44, false);
+          }
+        }
+      }
+      let macroAnim = { stage: null, timer: null, sub: 0 };
+      function stopMacroAnim() {
+        if (macroAnim.timer) clearInterval(macroAnim.timer);
+        macroAnim.timer = null;
+      }
+      function macroSubCount(stage) {
+        if (stage === "load") return 3;
+        if (stage === "shfl" || stage === "shfl2") return 2;
+        if (stage === "atomic") return 2;
+        if (stage === "barrier") return 2;
+        if (stage === "sum_accum") return 2;
+        return 1;
+      }
+      function renderMacroFrame(stage, sub) {
+        const svg = $("macroSvg");
+        if (!svg) return;
+        const nodes = {
+          gmemIn: { x: 24, y: 26, w: 210, h: 56, t: "Global Memory", s: "GDDR7 / VRAM（输入）" },
+          l2: { x: 270, y: 26, w: 170, h: 56, t: "L2 Cache", s: "统一缓存（≈96MB）" },
+          l1: { x: 474, y: 26, w: 200, h: 56, t: "SM: L1 + Shared", s: "每个 SM（L1≈128KB）" },
+          reg: { x: 708, y: 26, w: 248, h: 56, t: "Registers", s: "每线程寄存器（val）" },
+          shfl: { x: 474, y: 118, w: 200, h: 56, t: "Warp Shuffle", s: "warp 内寄存器交换" },
+          smem: { x: 270, y: 118, w: 170, h: 56, t: "Shared", s: "smem[warp_id]" },
+          gmemOut: { x: 24, y: 118, w: 210, h: 56, t: "Global Memory", s: "output（atomicAdd）" }
+        };
+        const edges = [
+          { id: "e_load_0", a: "gmemIn", b: "l2", cls: "" },
+          { id: "e_load_1", a: "l2", b: "l1", cls: "" },
+          { id: "e_load_2", a: "l1", b: "reg", cls: "" },
+          { id: "e_shfl", a: "reg", b: "shfl", cls: "shfl" },
+          { id: "e_shfl_back", a: "shfl", b: "reg", cls: "shfl" },
+          { id: "e_smem_w", a: "reg", b: "smem", cls: "smem" },
+          { id: "e_smem_r", a: "smem", b: "reg", cls: "smem" },
+          { id: "e_atomic_0", a: "reg", b: "l2", cls: "atomic" },
+          { id: "e_atomic_1", a: "l2", b: "gmemOut", cls: "atomic" }
+        ];
+        const activeNodes = new Set();
+        const activeEdges = new Set();
+        const pulseNodes = new Set();
+        const pick = (ids) => ids.forEach((x) => activeNodes.add(x));
+        const pickE = (ids) => ids.forEach((x) => activeEdges.add(x));
+        if (stage === "load") {
+          if (sub === 0) {
+            pick(["gmemIn", "l2"]);
+            pickE(["e_load_0"]);
+          } else if (sub === 1) {
+            pick(["gmemIn", "l2", "l1"]);
+            pickE(["e_load_0", "e_load_1"]);
+          } else {
+            pick(["gmemIn", "l2", "l1", "reg"]);
+            pickE(["e_load_0", "e_load_1", "e_load_2"]);
+          }
+        } else if (stage === "shfl" || stage === "shfl2") {
+          pick(["reg", "shfl"]);
+          pickE([sub === 0 ? "e_shfl" : "e_shfl_back"]);
+        } else if (stage === "smem_write") {
+          pick(["reg", "smem"]);
+          pickE(["e_smem_w"]);
+        } else if (stage === "smem_read") {
+          pick(["smem", "reg"]);
+          pickE(["e_smem_r"]);
+        } else if (stage === "atomic") {
+          if (sub === 0) {
+            pick(["reg", "l2"]);
+            pickE(["e_atomic_0"]);
+          } else {
+            pick(["reg", "l2", "gmemOut"]);
+            pickE(["e_atomic_0", "e_atomic_1"]);
+          }
+        } else if (stage === "barrier") {
+          pick(["l1", "smem"]);
+          if (sub === 0) pulseNodes.add("smem");
+          else pulseNodes.add("l1");
+        } else if (stage === "sum_accum") {
+          pick(["reg"]);
+          pulseNodes.add("reg");
+        } else {
+          pick(["gmemIn", "l2", "l1", "reg", "shfl", "smem", "gmemOut"]);
+        }
+        const hint = $("macroHint");
+        if (hint) {
+          let txt = "按当前步骤高亮数据路径";
+          if (stage === "load") {
+            txt = sub === 0 ? "输入(1/3)：Global → L2" : sub === 1 ? "输入(2/3)：L2 → SM(L1/Shared)" : "输入(3/3)：SM(L1) → Registers";
+          } else if (stage === "shfl") {
+            txt = sub === 0 ? "计算(1/2)：Registers → Warp Shuffle" : "计算(2/2)：Warp Shuffle → Registers";
+          } else if (stage === "smem_write") {
+            txt = "转移：Registers → Shared";
+          } else if (stage === "barrier") {
+            txt = sub === 0 ? "同步：等待 shared 写入完成" : "同步：shared 对 warp0 读可见";
+          } else if (stage === "smem_read") {
+            txt = "转移：Shared → Registers（warp0）";
+          } else if (stage === "shfl2") {
+            txt = sub === 0 ? "计算(1/2)：Registers → Warp Shuffle（warp0）" : "计算(2/2)：Warp Shuffle → Registers（warp0）";
+          } else if (stage === "sum_accum") {
+            txt = sub === 0 ? "累加：lane0 累加 batch 部分和" : "累加：sum 保存在寄存器中";
+          } else if (stage === "atomic") {
+            txt = sub === 0 ? "写回(1/2)：Registers → L2（原子操作）" : "写回(2/2)：L2 → Global output";
+          }
+          hint.textContent = txt;
+        }
+        const parts = [];
+        parts.push(`
+          <defs>
+            <marker id="mArrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(232, 236, 255, 0.55)"></path>
+            </marker>
+          </defs>
+        `);
+        for (const e of edges) {
+          const A = nodes[e.a];
+          const B = nodes[e.b];
+          const x1 = A.x + A.w;
+          const y1 = A.y + A.h / 2;
+          const x2 = B.x;
+          const y2 = B.y + B.h / 2;
+          const bend = Math.max(30, Math.min(90, (x2 - x1) * 0.35));
+          const d = `M ${x1} ${y1} C ${x1 + bend} ${y1} ${x2 - bend} ${y2} ${x2} ${y2}`;
+          const isActive = activeEdges.has(e.id);
+          parts.push(`<path class="mEdge ${e.cls} ${isActive ? "active" : ""}" d="${d}"></path>`);
+        }
+        for (const [id, n] of Object.entries(nodes)) {
+          const isActive = activeNodes.has(id);
+          const isPulse = pulseNodes.has(id);
+          parts.push(`<rect class="mNode ${isActive ? "active" : ""} ${isPulse ? "pulse" : ""}" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="12" ry="12"></rect>`);
+          parts.push(`<text class="mTxt" x="${n.x + 12}" y="${n.y + 24}">${n.t}</text>`);
+          parts.push(`<text class="mSub" x="${n.x + 12}" y="${n.y + 44}">${n.s}</text>`);
+        }
+        svg.innerHTML = parts.join("");
+      }
+      function renderMacro(stage) {
+        const count = macroSubCount(stage);
+        if (macroAnim.stage !== stage) {
+          stopMacroAnim();
+          macroAnim.stage = stage;
+          macroAnim.sub = 0;
+          if (count > 1) {
+            macroAnim.timer = setInterval(() => {
+              macroAnim.sub = (macroAnim.sub + 1) % count;
+              renderMacroFrame(macroAnim.stage, macroAnim.sub);
+            }, 420);
+          }
+        }
+        renderMacroFrame(stage, macroAnim.sub % count);
+      }
+      function renderState(sim, blockPick, stepIdx) {
+        const block = sim.blocks[blockPick];
+        const st = block.states[stepIdx];
+        $("blkBadge").textContent = `block ${blockPick}/${sim.gridSize - 1}`;
+        const atomic = st.highlights.atomic;
+        const globalOut = atomic ? atomic.globalOut : (() => {
+          let out = 0;
+          for (let i = 0; i < sim.blocks.length; i++) {
+            if (i < blockPick) out += sim.blocks[i].blockSum;
+            if (i === blockPick && stepIdx === sim.blocks[i].states.length - 1) out += sim.blocks[i].blockSum;
+          }
+          return out;
+        })();
+        $("outBadge").textContent = `output = ${fmt(globalOut)}`;
+        const blockSum = atomic ? atomic.blockSum : block.blockSum;
+        $("sumBadge").textContent = `block_sum = ${fmt(blockSum)}`;
+        $("stepText").innerHTML = `<span class="badge">${stepIdx + 1}/${block.states.length}</span> <span class="mono" style="margin-left:8px;">${st.stage}</span> <span style="margin-left:8px;">${st.detail}</span>`;
+        renderSmSchedule(parseInt($("smCount").value, 10) || 1, sim.gridSize, blockPick);
+        const threadGrid = $("threadGrid");
+        threadGrid.innerHTML = "";
+        threadGrid.style.gridTemplateColumns = "1fr";
+        const addMarks = new Set();
+        const fromMarks = new Set();
+        const addPairs = st.highlights.adds || [];
+        for (const p of addPairs) {
+          addMarks.add(p.toT);
+          fromMarks.add(p.fromT);
+        }
+        const threads = st.threads.slice().sort((a, b) => a.t - b.t);
+        for (const th of threads) {
+          const div = document.createElement("div");
+          const wClass = "w" + (th.warpId % 4);
+          div.className = "threadCell " + wClass + (addMarks.has(th.t) || fromMarks.has(th.t) ? " mark" : "");
+          div.dataset.t = String(th.t);
+          const meta1 = document.createElement("div");
+          meta1.className = "tMeta mono";
+          meta1.innerHTML = `<div>t=${th.t}</div><div class="muted">idx=${th.idx}</div>`;
+          const meta2 = document.createElement("div");
+          meta2.className = "tMeta mono";
+          meta2.innerHTML = `<div>w=${th.warpId}</div><div class="muted">lane=${th.laneId}</div>`;
+          const val = document.createElement("div");
+          val.className = "tVal mono";
+          const inRange = th.idx >= 0 && th.idx < parseInt($("N").value, 10);
+          val.innerHTML = `<div>val=${fmt(th.val)}</div><div class="muted">${inRange ? "" : "(越界→0)"}</div>`;
+          div.appendChild(meta1);
+          div.appendChild(meta2);
+          div.appendChild(val);
+          threadGrid.appendChild(div);
+        }
+        const smemGrid = $("smemGrid");
+        smemGrid.innerHTML = "";
+        const warpNum = block.warpNum;
+        const cols = clamp(Math.max(2, Math.min(8, warpNum || 2)), 2, 8);
+        smemGrid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+        const pickSmem = new Set();
+        for (const w of (st.highlights.writes || [])) pickSmem.add(w.smemIdx);
+        for (const l of (st.highlights.loads || [])) pickSmem.add(l.smemIdx);
+        for (let i = 0; i < warpNum; i++) {
+          const cell = document.createElement("div");
+          cell.className = "smemCell" + (pickSmem.has(i) ? " pick" : "");
+          cell.dataset.s = String(i);
+          const k = document.createElement("div");
+          k.className = "k mono";
+          k.textContent = `smem[${i}]`;
+          const v = document.createElement("div");
+          v.className = "v mono";
+          v.textContent = fmt(st.smem[i]);
+          cell.appendChild(k);
+          cell.appendChild(v);
+          smemGrid.appendChild(cell);
+        }
+        const opDesc = $("opDesc");
+        const extra = [];
+        if (st.stage === "shfl" || st.stage === "shfl2") {
+          extra.push("shuffle down 在硬件上是 warp 内寄存器交换的抽象，不需要 shared memory，典型延迟低于跨线程的 shared/barrier 方案。");
+          extra.push("真实 NVIDIA warp 固定为 32 lanes；partial warp 会通过 active mask 避免读取无效 lane。");
+        }
+        if (st.stage === "smem_write" || st.stage === "smem_read") {
+          extra.push("shared memory 位于 SM 内部，访问延迟远低于 global memory；但需要注意 bank conflict 等问题。");
+        }
+        if (st.stage === "barrier") {
+          extra.push("__syncthreads() 是 block 级屏障：保证写 shared 的线程都到达该点后，其他线程再继续读 shared。");
+        }
+        if (st.stage === "atomic") {
+          extra.push("atomicAdd 会对同一地址发生串行化竞争，跨 block 的归约常见做法是先写出每个 block 的部分和，再用二次 kernel 或者更高层做最终 reduce。");
+        }
+        opDesc.textContent = extra.length ? extra.join(" ") : "选择“播放/下一步”观察每一步发生的寄存器归约、shared 写入与读取，以及最终的 atomicAdd。";
+        wireCtx = { stage: st.stage, highlights: st.highlights };
+        requestAnimationFrame(() => renderWires(wireCtx));
+        renderMacro(st.stage);
+      }
+      let sim = null;
+      let stepIdx = 0;
+      let playing = false;
+      let timer = null;
+      function stop() {
+        playing = false;
+        if (timer) clearInterval(timer);
+        timer = null;
+        $("play").textContent = "播放";
+      }
+      function start() {
+        if (!sim) return;
+        playing = true;
+        $("play").textContent = "暂停";
+        const speed = parseFloat($("speed").value) || 1;
+        const interval = Math.max(120, Math.floor(520 / speed));
+        timer = setInterval(() => {
+          const b = getBlockPick();
+          const maxStep = sim.blocks[b].states.length - 1;
+          if (stepIdx >= maxStep) {
+            stop();
+            return;
+          }
+          stepIdx += 1;
+          renderState(sim, b, stepIdx);
+        }, interval);
+      }
+      function getParams() {
+        const N = parseInt($("N").value, 10);
+        const blockDim = parseInt($("blockDim").value, 10);
+        const smCount = parseInt($("smCount").value, 10);
+        const blockPick = parseInt($("blockPick").value, 10);
+        const pattern = $("pattern").value;
+        const seed = parseInt($("seed").value, 10);
+        return { N, blockDim, smCount, blockPick, pattern, seed };
+      }
+      function getBlockPick() {
+        if (!sim) return 0;
+        const raw = parseInt($("blockPick").value, 10) || 0;
+        const b = clamp(raw, 0, sim.gridSize - 1);
+        if (b !== raw) $("blockPick").value = String(b);
+        return b;
+      }
+      function renderStatus(notes, gridSize) {
+        const lines = [];
+        const by = { bad: [], warn: [], good: [] };
+        for (const [lvl, msg] of notes) by[lvl].push(msg);
+        if (by.bad.length) lines.push(`<span class="badge bad">错误</span> ${by.bad.join("；")}`);
+        if (by.warn.length) lines.push(`<span class="badge warn">提醒</span> ${by.warn.join("；")}`);
+        if (!by.bad.length && !by.warn.length) lines.push(`<span class="badge good">OK</span> 参数满足示例内核的基本假设`);
+        lines.push(`<span class="badge">grid_size</span> ${gridSize}`);
+        $("status").innerHTML = lines.join("<br/>");
+      }
+      function regenerate() {
+        stop();
+        const p = getParams();
+        const { notes, gridSize } = validateParams(p);
+        renderStatus(notes, gridSize);
+        const input = buildInput(p.N, p.pattern, p.seed);
+        sim = simulateAll({ input, N: p.N, blockDim: p.blockDim });
+        $("blockPick").max = String(Math.max(0, sim.gridSize - 1));
+        const b = clamp(p.blockPick, 0, sim.gridSize - 1);
+        $("blockPick").value = String(b);
+        stepIdx = 0;
+        renderState(sim, b, stepIdx);
+      }
+      $("regen").addEventListener("click", regenerate);
+      $("reset").addEventListener("click", () => {
+        stop();
+        stepIdx = 0;
+        if (!sim) regenerate();
+        renderState(sim, getBlockPick(), stepIdx);
+      });
+      $("play").addEventListener("click", () => {
+        if (!sim) regenerate();
+        if (playing) stop();
+        else start();
+      });
+      $("prev").addEventListener("click", () => {
+        stop();
+        if (!sim) regenerate();
+        stepIdx = Math.max(0, stepIdx - 1);
+        renderState(sim, getBlockPick(), stepIdx);
+      });
+      $("next").addEventListener("click", () => {
+        stop();
+        if (!sim) regenerate();
+        const b = getBlockPick();
+        const maxStep = sim.blocks[b].states.length - 1;
+        stepIdx = Math.min(maxStep, stepIdx + 1);
+        renderState(sim, b, stepIdx);
+      });
+      $("toStart").addEventListener("click", () => {
+        stop();
+        if (!sim) regenerate();
+        stepIdx = 0;
+        renderState(sim, getBlockPick(), stepIdx);
+      });
+      $("toEnd").addEventListener("click", () => {
+        stop();
+        if (!sim) regenerate();
+        const b = getBlockPick();
+        stepIdx = sim.blocks[b].states.length - 1;
+        renderState(sim, b, stepIdx);
+      });
+      $("blockPick").addEventListener("change", () => {
+        stop();
+        if (!sim) regenerate();
+        stepIdx = 0;
+        renderState(sim, getBlockPick(), stepIdx);
+      });
+      $("smCount").addEventListener("change", () => {
+        if (!sim) return;
+        renderState(sim, getBlockPick(), stepIdx);
+      });
+      $("speed").addEventListener("input", () => {
+        if (!playing) return;
+        stop();
+        start();
+      });
+      window.addEventListener("resize", () => {
+        if (!wireCtx) return;
+        requestAnimationFrame(() => renderWires(wireCtx));
+      });
+      regenerate();
+    </script>
+  </body>
+</html>
