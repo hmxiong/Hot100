@@ -182,7 +182,7 @@
       }
       .macroSvg {
         width: 100%;
-        height: 210px;
+        height: 240px;
         display: block;
       }
       .mNode {
@@ -444,7 +444,7 @@
               <h3>宏观数据流（5090 类 NVIDIA GPU）</h3>
               <div class="hint" id="macroHint">按当前步骤高亮：load / shuffle / shared / atomic</div>
             </div>
-            <svg class="macroSvg" id="macroSvg" viewBox="0 0 980 210" preserveAspectRatio="none" aria-hidden="true"></svg>
+            <svg class="macroSvg" id="macroSvg" viewBox="0 0 980 240" preserveAspectRatio="none" aria-hidden="true"></svg>
           </div>
           <div class="vizWrap" id="vizWrap">
             <svg class="wires" id="wires" aria-hidden="true"></svg>
@@ -731,24 +731,24 @@
         const svg = $("macroSvg");
         if (!svg) return;
         const nodes = {
-          gmemIn: { x: 24, y: 26, w: 210, h: 56, t: "Global Memory", s: "GDDR7 / VRAM（输入）" },
-          l2: { x: 270, y: 26, w: 170, h: 56, t: "L2 Cache", s: "统一缓存（≈96MB）" },
-          l1: { x: 474, y: 26, w: 200, h: 56, t: "SM: L1 + Shared", s: "每个 SM（L1≈128KB）" },
-          reg: { x: 708, y: 26, w: 248, h: 56, t: "Registers", s: "每线程寄存器（val）" },
-          shfl: { x: 474, y: 118, w: 200, h: 56, t: "Warp Shuffle", s: "warp 内寄存器交换" },
-          smem: { x: 270, y: 118, w: 170, h: 56, t: "Shared", s: "smem[warp_id]" },
-          gmemOut: { x: 24, y: 118, w: 210, h: 56, t: "Global Memory", s: "output（atomicAdd）" }
+          gmemIn: { x: 20, y: 22, w: 190, h: 56, t: "Global Memory", s: "GDDR7 / VRAM（输入）" },
+          l2: { x: 230, y: 22, w: 160, h: 56, t: "L2 Cache", s: "统一缓存（≈96MB）" },
+          l1: { x: 410, y: 22, w: 180, h: 56, t: "SM: L1 + Shared", s: "每个 SM（L1≈128KB）" },
+          reg: { x: 610, y: 22, w: 180, h: 56, t: "Registers", s: "每线程寄存器（val）" },
+          gmemOut: { x: 790, y: 22, w: 190, h: 56, t: "Global Memory", s: "output（atomicAdd）" },
+          smem: { x: 410, y: 128, w: 180, h: 56, t: "Shared", s: "smem[warp_id]" },
+          shfl: { x: 610, y: 128, w: 180, h: 56, t: "Warp Shuffle", s: "warp 内寄存器交换" }
         };
         const edges = [
-          { id: "e_load_0", a: "gmemIn", b: "l2", cls: "" },
-          { id: "e_load_1", a: "l2", b: "l1", cls: "" },
-          { id: "e_load_2", a: "l1", b: "reg", cls: "" },
-          { id: "e_shfl", a: "reg", b: "shfl", cls: "shfl" },
-          { id: "e_shfl_back", a: "shfl", b: "reg", cls: "shfl" },
-          { id: "e_smem_w", a: "reg", b: "smem", cls: "smem" },
-          { id: "e_smem_r", a: "smem", b: "reg", cls: "smem" },
-          { id: "e_atomic_0", a: "reg", b: "l2", cls: "atomic" },
-          { id: "e_atomic_1", a: "l2", b: "gmemOut", cls: "atomic" }
+          { id: "e_load_0", a: "gmemIn", aside: "right", b: "l2", bside: "left", cls: "" },
+          { id: "e_load_1", a: "l2", aside: "right", b: "l1", bside: "left", cls: "" },
+          { id: "e_load_2", a: "l1", aside: "right", b: "reg", bside: "left", cls: "" },
+          { id: "e_shfl", a: "reg", aside: "bottom", b: "shfl", bside: "top", cls: "shfl", offset: { sx: -14, tx: -14 } },
+          { id: "e_shfl_back", a: "shfl", aside: "top", b: "reg", bside: "bottom", cls: "shfl", offset: { sx: 14, tx: 14 } },
+          { id: "e_smem_w", a: "reg", aside: "bottom", b: "smem", bside: "top", cls: "smem", trackY: 206, offset: { sx: -26, tx: -26 } },
+          { id: "e_smem_r", a: "smem", aside: "top", b: "reg", bside: "bottom", cls: "smem", trackY: 194, offset: { sx: 26, tx: 26 } },
+          { id: "e_atomic_0", a: "reg", aside: "bottom", b: "l2", bside: "bottom", cls: "atomic", trackY: 232, offset: { sx: 26, tx: 0 } },
+          { id: "e_atomic_1", a: "l2", aside: "right", b: "gmemOut", bside: "left", cls: "atomic" }
         ];
         const activeNodes = new Set();
         const activeEdges = new Set();
@@ -823,15 +823,33 @@
             </marker>
           </defs>
         `);
+        const anchor = (n, side) => {
+          if (side === "left") return { x: n.x, y: n.y + n.h / 2 };
+          if (side === "right") return { x: n.x + n.w, y: n.y + n.h / 2 };
+          if (side === "top") return { x: n.x + n.w / 2, y: n.y };
+          return { x: n.x + n.w / 2, y: n.y + n.h };
+        };
+        const applyOff = (p, o, which) => {
+          if (!o) return p;
+          const dx = which === "s" ? (o.sx || 0) : (o.tx || 0);
+          const dy = which === "s" ? (o.sy || 0) : (o.ty || 0);
+          return { x: p.x + dx, y: p.y + dy };
+        };
+        const ortho = (p1, p2, midY = null) => {
+          if (midY === null) {
+            const midX = (p1.x + p2.x) / 2;
+            return `M ${p1.x} ${p1.y} L ${midX} ${p1.y} L ${midX} ${p2.y} L ${p2.x} ${p2.y}`;
+          }
+          return `M ${p1.x} ${p1.y} L ${p1.x} ${midY} L ${p2.x} ${midY} L ${p2.x} ${p2.y}`;
+        };
         for (const e of edges) {
           const A = nodes[e.a];
           const B = nodes[e.b];
-          const x1 = A.x + A.w;
-          const y1 = A.y + A.h / 2;
-          const x2 = B.x;
-          const y2 = B.y + B.h / 2;
-          const bend = Math.max(30, Math.min(90, (x2 - x1) * 0.35));
-          const d = `M ${x1} ${y1} C ${x1 + bend} ${y1} ${x2 - bend} ${y2} ${x2} ${y2}`;
+          let p1 = anchor(A, e.aside || "right");
+          let p2 = anchor(B, e.bside || "left");
+          p1 = applyOff(p1, e.offset, "s");
+          p2 = applyOff(p2, e.offset, "t");
+          const d = ortho(p1, p2, typeof e.trackY === "number" ? e.trackY : null);
           const isActive = activeEdges.has(e.id);
           parts.push(`<path class="mEdge ${e.cls} ${isActive ? "active" : ""}" d="${d}"></path>`);
         }
