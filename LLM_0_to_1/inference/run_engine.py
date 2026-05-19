@@ -3,17 +3,19 @@ import time
 import warnings
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from .engine import GenerationParams, InferenceEngine
 from .engine.engine import EngineConfig
+
+from .models.model import MiniMindForCausalLM
 
 warnings.filterwarnings("ignore")
 
 
 def init_model(load_from: str, device: str):
     tokenizer = AutoTokenizer.from_pretrained(load_from)
-    model = AutoModelForCausalLM.from_pretrained(load_from, trust_remote_code=True)
+    model = MiniMindForCausalLM.from_pretrained(load_from, trust_remote_code=True)
     return model.half().eval().to(device), tokenizer
 
 
@@ -26,6 +28,7 @@ def main():
     parser.add_argument("--load_from", default="model", type=str)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str)
     parser.add_argument("--max_batch_size", default=4, type=int)
+    parser.add_argument("--use_kv_cache", default=0, type=int, choices=[0, 1])
     parser.add_argument("--max_new_tokens", default=256, type=int)
     parser.add_argument("--temperature", default=0.85, type=float)
     parser.add_argument("--top_p", default=0.95, type=float)
@@ -33,7 +36,11 @@ def main():
     args = parser.parse_args()
 
     model, tokenizer = init_model(args.load_from, args.device)
-    engine = InferenceEngine(model, tokenizer, EngineConfig(device=args.device, max_batch_size=args.max_batch_size))
+    engine = InferenceEngine(
+        model,
+        tokenizer,
+        EngineConfig(device=args.device, max_batch_size=args.max_batch_size, use_kv_cache=bool(args.use_kv_cache)),
+    )
 
     prompts = [
         "你有什么特长？",
@@ -82,4 +89,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -4,12 +4,13 @@ import random
 import warnings
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
+from models.model import MiniMindForCausalLM
 
 warnings.filterwarnings('ignore')
 
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
-    model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
+    model = MiniMindForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     return model.half().eval().to(args.device), tokenizer
 
 def main():

@@ -14,3 +14,13 @@
 - 验证
   - 直接运行 `python -m LLM_0_to_1.inference.run_engine --load_from <模型路径>`，观察多请求同时推进并输出总 tokens/s。
 
+### 重构：基于 MiniMind 的 KVCache 形态整理 Engine.step（去除 legacy/DynamicCache 兼容分支）
+- 改动
+  - `InferenceEngine.step` 改为自管理 running/waiting 队列，不再依赖 scheduler。
+  - 推理一步拆成两条确定路径：prefill（无 KV）与 decode（有 KV），并按长度分组做 micro-batch。
+  - KVCache 直接存 MiniMind 的 `past_key_values: list[(k,v)]`（每个 request 保存 batch=1 的切片）。
+- 动机
+  - MiniMind 的 `past_key_values` 形态稳定，便于你后续在 KV 上做 paged/radix/chunked 的实验。
+  - MiniMind 当前实现里 `start_pos` 从 `past_key_values[0][0].shape[1]` 推断，batch 内必须同长度；因此用分组 micro-batch 保证正确性。
+- 验证
+  - `python -m LLM_0_to_1.inference.run_engine --load_from <MiniMind/HF目录> --use_kv_cache 1`
