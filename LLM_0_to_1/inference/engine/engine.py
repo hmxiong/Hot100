@@ -114,7 +114,7 @@ class InferenceEngine:
             )
 
         logits = outputs.logits[:, -1, :]
-        new_past = outputs.past_key_values
+        new_past = self._to_legacy_cache_if_possible(outputs.past_key_values)
 
         for i, req in enumerate(batch):
             req.last_logits = logits[i]
@@ -137,6 +137,15 @@ class InferenceEngine:
                 req.status = RequestStatus.FINISHED
 
         self._scatter_past_to_requests(batch, new_past)
+
+    @staticmethod
+    def _to_legacy_cache_if_possible(past_key_values):
+        if past_key_values is None:
+            return None
+        to_legacy = getattr(past_key_values, "to_legacy_cache", None)
+        if callable(to_legacy):
+            return to_legacy()
+        return past_key_values
 
     def _build_batched_inputs(self, batch: list[Request]) -> tuple[torch.Tensor, torch.Tensor]:
         max_len = max(int(r.input_ids.shape[-1] + r.num_generated) for r in batch)
@@ -167,7 +176,8 @@ class InferenceEngine:
         if all(v.past_key_values is None for v in views):
             return None
 
-        return self._stack_past_key_values([v.past_key_values for v in views])
+        pkvs = [self._to_legacy_cache_if_possible(v.past_key_values) for v in views]
+        return self._stack_past_key_values(pkvs)
 
     def _stack_past_key_values(self, pkvs: list[Optional[tuple]]):
         template = next((p for p in pkvs if p is not None), None)
@@ -197,6 +207,13 @@ class InferenceEngine:
         if batched_past is None:
             return
 
+        batch_split = getattr(batched_past, "batch_split", None)
+        if callable(batch_split):
+            per_request = batch_split(batch_size=len(batch))
+            for req, pkv in zip(batch, per_request):
+                self.kv_cache.set_view(req.request_id, KVCacheView(past_key_values=pkv))
+            return
+
         per_request = self._unstack_past_key_values(batched_past, batch_size=len(batch))
         for req, pkv in zip(batch, per_request):
             self.kv_cache.set_view(req.request_id, KVCacheView(past_key_values=pkv))
@@ -218,4 +235,3 @@ class InferenceEngine:
             if progressed == 0 and poll_interval_s > 0:
                 time.sleep(poll_interval_s)
         return list(self._finished)
-

@@ -8,7 +8,7 @@ import torch
 
 @dataclass(slots=True)
 class KVCacheView:
-    past_key_values: Optional[tuple]
+    past_key_values: Optional[object]
 
 
 class KVCache:
@@ -37,4 +37,3 @@ class NaiveKVCache(KVCache):
 
     def free(self, request_id: str) -> None:
         self._store.pop(request_id, None)
-
