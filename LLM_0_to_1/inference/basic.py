@@ -49,6 +49,8 @@ def main():
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
+    st = time.time()
+    total_tokens = 0
     for prompt in prompt_iter:
         if input_mode == 0: print(f'💬: {prompt}')
         conversation = conversation[-args.historys:] if args.historys else []
@@ -71,7 +73,10 @@ def main():
         response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": response})
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
+        total_tokens += gen_tokens
         print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
-
+    elapsed = time.time() - st
+    print(f"\n总生成: {total_tokens} tokens; wall={elapsed:.2f}s; {total_tokens/elapsed:.2f} tokens/s\n")
+    
 if __name__ == "__main__":
     main()
