@@ -80,31 +80,53 @@ class InferenceEngine:
     def step(self) -> int:
         self._running = [r for r in self._running if not r.is_finished]
 
-        batch: list[Request] = []
+        use_cache = bool(self.config.use_kv_cache)
+        buckets: dict[tuple[str, int], list[Request]] = {}
+
         for r in self._running:
-            if len(batch) >= self.config.max_batch_size:
-                break
-            if r.status == RequestStatus.RUNNING and not r.is_finished:
-                batch.append(r)
+            if r.status != RequestStatus.RUNNING or r.is_finished:
+                continue
+            view = self.kv_cache.get_view(r.request_id)
+            if use_cache and view.past_key_values is not None:
+                past_len = int(view.past_key_values[0][0].shape[1])
+                key = ("decode", past_len)
+            else:
+                key = ("prefill", int(r.prompt_len))
+            buckets.setdefault(key, []).append(r)
 
-        remaining = self.config.max_batch_size - len(batch)
-        if remaining > 0:
-            admitted = []
-            for r in self._waiting:
-                if len(admitted) >= remaining:
-                    break
-                if r.status == RequestStatus.WAITING and not r.is_finished:
-                    r.status = RequestStatus.RUNNING
-                    admitted.append(r)
-            if admitted:
-                self._running.extend(admitted)
-                self._waiting = [r for r in self._waiting if r.status == RequestStatus.WAITING]
-                batch.extend(admitted)
+        for r in self._waiting:
+            if r.status != RequestStatus.WAITING or r.is_finished:
+                continue
+            key = ("prefill", int(r.prompt_len))
+            buckets.setdefault(key, []).append(r)
 
-        if not batch:
+        if not buckets:
             return 0
 
-        self._run_one_step(batch)
+        sorted_keys = sorted(
+            buckets.keys(), key=lambda k: (0 if k[0] == "decode" else 1, -len(buckets[k]), k)
+        )
+        chosen_key = sorted_keys[0]
+        chosen = buckets[chosen_key][: self.config.max_batch_size]
+        chosen_ids = {c.request_id for c in chosen}
+
+        if chosen_key[0] == "prefill":
+            newly_started = []
+            still_waiting = []
+            for r in self._waiting:
+                if r.request_id in chosen_ids:
+                    r.status = RequestStatus.RUNNING
+                    newly_started.append(r)
+                else:
+                    still_waiting.append(r)
+            if newly_started:
+                self._waiting = still_waiting
+                running_ids = {r.request_id for r in self._running}
+                for r in newly_started:
+                    if r.request_id not in running_ids:
+                        self._running.append(r)
+
+        self._run_one_step(chosen)
 
         still_running: list[Request] = []
         for r in self._running:
@@ -114,7 +136,7 @@ class InferenceEngine:
             else:
                 still_running.append(r)
         self._running = still_running
-        return len(batch)
+        return len(chosen)
 
     def _run_one_step(self, batch: list[Request]) -> None:
         if not batch:
