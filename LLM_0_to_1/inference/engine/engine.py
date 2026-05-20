@@ -19,6 +19,22 @@ class EngineConfig:
     use_kv_cache: bool = False
 
 
+@dataclass(slots=True)
+class _DecodeGroup:
+    past_len: int
+    requests: list[Request]
+    past_key_values: object
+
+
+@dataclass(slots=True)
+class _BatchGenerateState:
+    prompt_lens: torch.Tensor
+    generated_lens: torch.Tensor
+    finished: torch.Tensor
+    eos_hit: torch.Tensor
+    generated_token_ids: list[list[int]]
+
+
 class InferenceEngine:
     def __init__(
         self,
@@ -32,263 +48,193 @@ class InferenceEngine:
         self.config = config
         self.kv_cache = kv_cache or NaiveKVCache()
 
+        # self.sampler = 
+
         self._waiting: list[Request] = []
         self._running: list[Request] = []
         self._finished: list[Request] = []
+        self._requests: dict[str, Request] = {}
+        self._decode_groups: list[_DecodeGroup] = []
+        self._last_batch_state: _BatchGenerateState | None = None
 
-    def add_request(
+    def _init_batch_state(self, input_ids: torch.Tensor) -> _BatchGenerateState:
+        batch_size, prompt_len = input_ids.shape
+        prompt_lens = torch.full((batch_size,), int(prompt_len), device=input_ids.device, dtype=torch.long)
+        return _BatchGenerateState(
+            prompt_lens=prompt_lens,
+            generated_lens=torch.zeros((batch_size,), device=input_ids.device, dtype=torch.long),
+            finished=torch.zeros((batch_size,), device=input_ids.device, dtype=torch.bool),
+            eos_hit=torch.zeros((batch_size,), device=input_ids.device, dtype=torch.bool),
+            generated_token_ids=[[] for _ in range(batch_size)],
+        )
+
+    def _sample_batch_next_tokens(
         self,
-        prompt: str,
-        params: GenerationParams,
-        request_id: Optional[str] = None,
-        conversation: Optional[list[dict]] = None,
-        is_pretrain: bool = False,
-        open_thinking: bool = False,
-    ) -> str:
-        rid = request_id or uuid.uuid4().hex
-        if is_pretrain:
-            text = (getattr(self.tokenizer, "bos_token", None) or "") + prompt
-        else:
-            apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
-            if callable(apply_chat_template):
-                conv = conversation or [{"role": "user", "content": prompt}]
-                text = apply_chat_template(
-                    conv, tokenize=False, add_generation_prompt=True, open_thinking=bool(open_thinking)
-                )
-            else:
-                text = prompt
+        logits_last: torch.Tensor,
+        state: _BatchGenerateState,
+        temperature: float,
+        top_p: float | None,
+        repetition_penalty: float,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        batch_size = int(logits_last.shape[0])
+        token_ids: list[int] = []
+        for b in range(batch_size):
+            if bool(state.finished[b].item()):
+                token_ids.append(0)
+                continue
+            sampled = sample_next_token(
+                logits=logits_last[b],
+                temperature=temperature,
+                top_p=top_p,
+                generated_token_ids=state.generated_token_ids[b],
+                repetition_penalty=repetition_penalty,
+                generator=generator,
+            ).token_id
+            token_ids.append(int(sampled))
+        return torch.tensor(token_ids, device=logits_last.device, dtype=torch.long).view(batch_size, 1)
 
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True)
-        input_ids = inputs["input_ids"].to(self.config.device)
-        attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids)).to(self.config.device)
-        req = Request(
-            request_id=rid,
+    def _update_batch_state(
+        self,
+        state: _BatchGenerateState,
+        next_token: torch.Tensor,
+        eos_token_id: int | None,
+        max_new_tokens: int,
+    ) -> None:
+        batch_size = int(next_token.shape[0])
+        token_column = next_token.squeeze(-1)
+        prev_finished = state.finished.clone()
+        for b in range(batch_size):
+            if bool(prev_finished[b].item()):
+                continue
+            token_id = int(token_column[b].item())
+            state.generated_token_ids[b].append(token_id)
+            state.generated_lens[b] += 1
+            if eos_token_id is not None and token_id == int(eos_token_id):
+                state.eos_hit[b] = True
+                state.finished[b] = True
+            elif int(state.generated_lens[b].item()) >= int(max_new_tokens):
+                state.finished[b] = True
+
+    @torch.inference_mode()
+    def _generate_batch_impl(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        max_new_tokens: int = 256,
+        eos_token_id: int | None = None,
+        temperature: float = 0.85,
+        top_p: float | None = 0.95,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.0,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must be 2D (B,T), got shape={tuple(input_ids.shape)}")
+        if max_new_tokens <= 0:
+            return input_ids
+        if temperature is None or temperature <= 0:
+            do_sample = False
+            temperature = 1.0
+
+        if hasattr(self.model, "reset_kv_cache"):
+            self.model.reset_kv_cache()
+
+        generated = input_ids
+        batch_size, prompt_len = generated.shape
+        state = self._init_batch_state(generated)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
+        else:
+            attention_mask = attention_mask.to(device=input_ids.device, dtype=torch.long)
+        state.prompt_lens = attention_mask.sum(dim=1).to(dtype=torch.long)
+        self._last_batch_state = state
+
+        positions = torch.arange(prompt_len, device=generated.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        logits_last = self.model.prefill(generated, positions=positions, attention_mask=attention_mask)
+
+        for _ in range(int(max_new_tokens)):
+            active_mask = ~state.finished.clone()
+            sample_temperature = float(temperature) if do_sample else 0.0
+            next_token = self._sample_batch_next_tokens(
+                logits_last=logits_last,
+                state=state,
+                temperature=sample_temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                generator=generator,
+            )
+
+            if eos_token_id is not None:
+                eos = int(eos_token_id)
+                next_token = torch.where(
+                    state.finished.unsqueeze(-1), next_token.new_full((next_token.shape[0], 1), eos), next_token
+                )
+
+            generated = torch.cat([generated, next_token], dim=-1)
+            self._update_batch_state(
+                state=state,
+                next_token=next_token,
+                eos_token_id=eos_token_id,
+                max_new_tokens=int(max_new_tokens),
+            )
+
+            if bool(state.finished.all().item()):
+                break
+
+            step_positions = (state.prompt_lens + state.generated_lens - 1).clamp(min=0).view(batch_size, 1)
+            logits_last = self.model.decode(next_token, positions=step_positions, active_mask=active_mask)
+        
+        return generated
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        max_new_tokens: int = 256,
+        eos_token_id: int | None = None,
+        temperature: float = 0.85,
+        top_p: float | None = 0.95,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.0,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        return self._generate_batch_impl(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            params=params,
-            prompt_len=int(input_ids.shape[-1]),
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            generator=generator,
         )
-        self._waiting.append(req)
-        return rid
 
-    def get_request(self, request_id: str) -> Optional[Request]:
-        for r in self._waiting + self._running + self._finished:
-            if r.request_id == request_id:
-                return r
-        return None
-
-    def step(self) -> int:
-        self._running = [r for r in self._running if not r.is_finished]
-
-        use_cache = bool(self.config.use_kv_cache)
-        buckets: dict[tuple[str, int], list[Request]] = {}
-
-        for r in self._running:
-            if r.status != RequestStatus.RUNNING or r.is_finished:
-                continue
-            view = self.kv_cache.get_view(r.request_id)
-            if use_cache and view.past_key_values is not None:
-                past_len = int(view.past_key_values[0][0].shape[1])
-                key = ("decode", past_len)
-            else:
-                key = ("prefill", int(r.prompt_len))
-            buckets.setdefault(key, []).append(r)
-
-        for r in self._waiting:
-            if r.status != RequestStatus.WAITING or r.is_finished:
-                continue
-            key = ("prefill", int(r.prompt_len))
-            buckets.setdefault(key, []).append(r)
-
-        if not buckets:
-            return 0
-
-        sorted_keys = sorted(
-            buckets.keys(), key=lambda k: (0 if k[0] == "decode" else 1, -len(buckets[k]), k)
+    @torch.inference_mode()
+    def generate_batch(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        max_new_tokens: int = 256,
+        eos_token_id: int | None = None,
+        temperature: float = 0.85,
+        top_p: float | None = 0.95,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.0,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        return self._generate_batch_impl(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            generator=generator,
         )
-        chosen_key = sorted_keys[0]
-        chosen = buckets[chosen_key][: self.config.max_batch_size]
-        chosen_ids = {c.request_id for c in chosen}
-
-        if chosen_key[0] == "prefill":
-            newly_started = []
-            still_waiting = []
-            for r in self._waiting:
-                if r.request_id in chosen_ids:
-                    r.status = RequestStatus.RUNNING
-                    newly_started.append(r)
-                else:
-                    still_waiting.append(r)
-            if newly_started:
-                self._waiting = still_waiting
-                running_ids = {r.request_id for r in self._running}
-                for r in newly_started:
-                    if r.request_id not in running_ids:
-                        self._running.append(r)
-
-        self._run_one_step(chosen)
-
-        still_running: list[Request] = []
-        for r in self._running:
-            if r.is_finished:
-                self._finished.append(r)
-                self.kv_cache.free(r.request_id)
-            else:
-                still_running.append(r)
-        self._running = still_running
-        return len(chosen)
-
-    def _run_one_step(self, batch: list[Request]) -> None:
-        if not batch:
-            return
-
-        use_cache = bool(self.config.use_kv_cache)
-        prefill: list[Request] = []
-        decode: list[Request] = []
-        for r in batch:
-            view = self.kv_cache.get_view(r.request_id)
-            if use_cache and view.past_key_values is not None:
-                decode.append(r)
-            else:
-                prefill.append(r)
-
-        if prefill:
-            self._run_prefill(prefill, use_cache=use_cache)
-        if decode:
-            self._run_decode(decode, use_cache=use_cache)
-
-    def _run_prefill(self, requests: list[Request], use_cache: bool) -> None:
-        groups: dict[int, list[Request]] = {}
-        for r in requests:
-            groups.setdefault(int(r.prompt_len), []).append(r)
-
-        for _, reqs in groups.items():
-            input_ids = torch.cat([r.input_ids for r in reqs], dim=0)
-            attention_mask = torch.cat([r.attention_mask for r in reqs], dim=0)
-
-            with torch.inference_mode():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=use_cache,
-                    past_key_values=None,
-                )
-
-            logits = outputs.logits[:, -1, :]
-            if use_cache:
-                self._write_past_per_request(reqs, outputs.past_key_values)
-
-            for i, req in enumerate(reqs):
-                req.last_logits = logits[i]
-                token_id = sample_next_token(
-                    logits=logits[i],
-                    temperature=req.params.temperature,
-                    top_p=req.params.top_p,
-                    generated_token_ids=req.generated_ids,
-                    repetition_penalty=req.params.repetition_penalty,
-                ).token_id
-                req.generated_ids.append(token_id)
-                req.attention_mask = torch.cat(
-                    [req.attention_mask, req.attention_mask.new_ones((1, 1))], dim=1
-                )
-                self._maybe_finish(req, token_id)
-
-    def _run_decode(self, requests: list[Request], use_cache: bool) -> None:
-        groups: dict[int, list[Request]] = {}
-        for r in requests:
-            view = self.kv_cache.get_view(r.request_id)
-            past = view.past_key_values
-            if past is None:
-                continue
-            past_len = int(past[0][0].shape[1])
-            groups.setdefault(past_len, []).append(r)
-
-        for past_len, reqs in groups.items():
-            token_ids = [int(r.generated_ids[-1]) for r in reqs]
-            input_ids = torch.tensor(token_ids, device=self.config.device, dtype=torch.long).view(-1, 1)
-
-            attention_mask_rows = []
-            batched_past = self._stack_minimind_past([self.kv_cache.get_view(r.request_id).past_key_values for r in reqs])
-            for r in reqs:
-                if int(r.attention_mask.shape[1]) != past_len + 1:
-                    attention_mask_rows.append(torch.ones((1, past_len + 1), device=self.config.device, dtype=torch.long))
-                else:
-                    attention_mask_rows.append(r.attention_mask)
-            attention_mask = torch.cat(attention_mask_rows, dim=0)
-
-            with torch.inference_mode():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=use_cache,
-                    past_key_values=batched_past,
-                )
-
-            logits = outputs.logits[:, -1, :]
-            if use_cache:
-                self._write_past_per_request(reqs, outputs.past_key_values)
-
-            for i, req in enumerate(reqs):
-                req.last_logits = logits[i]
-                token_id = sample_next_token(
-                    logits=logits[i],
-                    temperature=req.params.temperature,
-                    top_p=req.params.top_p,
-                    generated_token_ids=req.generated_ids,
-                    repetition_penalty=req.params.repetition_penalty,
-                ).token_id
-                req.generated_ids.append(token_id)
-                req.attention_mask = torch.cat(
-                    [req.attention_mask, req.attention_mask.new_ones((1, 1))], dim=1
-                )
-                self._maybe_finish(req, token_id)
-
-    def _maybe_finish(self, req: Request, token_id: int) -> None:
-        eos_id = req.params.eos_token_id
-        if eos_id is None:
-            eos_id = getattr(self.tokenizer, "eos_token_id", None)
-
-        if eos_id is not None and token_id == int(eos_id):
-            req.status = RequestStatus.FINISHED
-            return
-        if req.num_generated >= int(req.params.max_new_tokens):
-            req.status = RequestStatus.FINISHED
-
-    @staticmethod
-    def _stack_minimind_past(pasts: list):
-        template = next((p for p in pasts if p is not None), None)
-        if template is None:
-            return None
-        num_layers = len(template)
-        out = []
-        for layer_idx in range(num_layers):
-            ks = []
-            vs = []
-            for p in pasts:
-                k, v = p[layer_idx]
-                ks.append(k)
-                vs.append(v)
-            out.append((torch.cat(ks, dim=0), torch.cat(vs, dim=0)))
-        return out
-
-    def _write_past_per_request(self, requests: list[Request], batched_past) -> None:
-        if batched_past is None:
-            for r in requests:
-                self.kv_cache.set_view(r.request_id, KVCacheView(past_key_values=None))
-            return
-
-        batch_size = len(requests)
-        num_layers = len(batched_past)
-        for b, r in enumerate(requests):
-            per_layer = []
-            for l in range(num_layers):
-                k, v = batched_past[l]
-                per_layer.append((k[b : b + 1].contiguous(), v[b : b + 1].contiguous()))
-            self.kv_cache.set_view(r.request_id, KVCacheView(past_key_values=per_layer))
-
-    def run_until_complete(self, poll_interval_s: float = 0.0) -> list[Request]:
-        while self._waiting or self._running:
-            progressed = self.step()
-            if progressed == 0 and poll_interval_s > 0:
-                time.sleep(poll_interval_s)
-        return list(self._finished)
+            
+        

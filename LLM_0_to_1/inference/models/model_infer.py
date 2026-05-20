@@ -1,8 +1,13 @@
-import math, torch, torch.nn.functional as F
+import json
+import math
+import os
+
+import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+# from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Config
@@ -83,6 +88,26 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
 
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, max_position_embeddings: int, base: float, rope_scaling: dict | None = None):
+        super().__init__()
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=head_dim,
+            end=int(max_position_embeddings),
+            rope_base=float(base),
+            rope_scaling=rope_scaling,
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        cos = self.freqs_cos[positions]
+        sin = self.freqs_sin[positions]
+        if q.ndim == 4:
+            return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
+        return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1: return x
@@ -107,31 +132,133 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+        self.rotary_emb = RotaryEmbedding(
+            head_dim=int(self.head_dim),
+            max_position_embeddings=int(config.max_position_embeddings),
+            base=float(config.rope_theta),
+            rope_scaling=getattr(config, "rope_scaling", None),
+        )
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.cache_lens = torch.tensor([], dtype=torch.long)
 
-    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def reset_kv_cache(self) -> None:
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.cache_lens = torch.tensor([], dtype=torch.long)
+
+    def check_kv_cache(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> bool:
+        if self.k_cache.numel() == 0 or self.v_cache.numel() == 0:
+            return False
+        if self.k_cache.device != device or self.v_cache.device != device:
+            self.reset_kv_cache()
+            return False
+        if self.k_cache.dtype != dtype or self.v_cache.dtype != dtype:
+            self.reset_kv_cache()
+            return False
+        if self.k_cache.ndim != 4 or self.v_cache.ndim != 4:
+            self.reset_kv_cache()
+            return False
+        if int(self.k_cache.shape[0]) != int(batch_size) or int(self.v_cache.shape[0]) != int(batch_size):
+            self.reset_kv_cache()
+            return False
+        if int(self.k_cache.shape[2]) != int(self.n_local_kv_heads) or int(self.v_cache.shape[2]) != int(self.n_local_kv_heads):
+            self.reset_kv_cache()
+            return False
+        if int(self.k_cache.shape[3]) != int(self.head_dim) or int(self.v_cache.shape[3]) != int(self.head_dim):
+            self.reset_kv_cache()
+            return False
+        if self.cache_lens.numel() != int(batch_size):
+            self.reset_kv_cache()
+            return False
+        return True
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ):
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xq, xk = self.q_norm(xq), self.k_norm(xk)
-        cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
-        if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
-            xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None
-        xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+        xq, xk = self.rotary_emb(positions, xq, xk)
+
+        if attention_mask is None:
+            token_mask = torch.ones((bsz, seq_len), device=x.device, dtype=torch.bool)
+        else:
+            token_mask = attention_mask.to(device=x.device, dtype=torch.bool)
+        token_mask_4d = token_mask.view(bsz, seq_len, 1, 1)
+
+        has_cache = self.check_kv_cache(batch_size=int(bsz), device=x.device, dtype=x.dtype)
+        if has_cache:
+            if active_mask is None:
+                active_mask = torch.ones((bsz,), device=x.device, dtype=torch.bool)
+            else:
+                active_mask = active_mask.to(device=x.device, dtype=torch.bool)
+            token_mask = token_mask & active_mask.view(bsz, 1)
+            valid_counts = token_mask.to(dtype=torch.long).sum(dim=1)
+            new_cache_lens = self.cache_lens + valid_counts
+            max_cache_len = max(int(self.k_cache.shape[1]), int(new_cache_lens.max().item()))
+            k_all = self.k_cache.new_zeros((bsz, max_cache_len, self.n_local_kv_heads, self.head_dim))
+            v_all = self.v_cache.new_zeros((bsz, max_cache_len, self.n_local_kv_heads, self.head_dim))
+            prev_len = int(self.k_cache.shape[1])
+            if prev_len > 0:
+                k_all[:, :prev_len] = self.k_cache
+                v_all[:, :prev_len] = self.v_cache
+            for b in range(bsz):
+                valid_idx = torch.nonzero(token_mask[b], as_tuple=False).flatten()
+                if valid_idx.numel() == 0:
+                    continue
+                start = int(self.cache_lens[b].item())
+                end = start + int(valid_idx.numel())
+                k_all[b, start:end] = xk[b, valid_idx]
+                v_all[b, start:end] = xv[b, valid_idx]
+            self.cache_lens = new_cache_lens
+        else:
+            k_all = torch.where(token_mask_4d, xk, torch.zeros_like(xk))
+            v_all = torch.where(token_mask_4d, xv, torch.zeros_like(xv))
+            self.cache_lens = token_mask.to(dtype=torch.long).sum(dim=1)
+        self.k_cache = k_all
+        self.v_cache = v_all
+
+        xq = xq.transpose(1, 2)
+        xk = repeat_kv(k_all, self.n_rep).transpose(1, 2)
+        xv = repeat_kv(v_all, self.n_rep).transpose(1, 2)
+
+        use_flash_path = (
+            self.flash
+            and (seq_len > 1)
+            and (not self.is_causal or not has_cache)
+            and bool(torch.all(token_mask).item())
+        )
+        if use_flash_path:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=self.is_causal,
+            )
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            if self.is_causal:
+                scores[:, :, :, -seq_len:] += torch.full(
+                    (seq_len, seq_len), float("-inf"), device=scores.device, dtype=scores.dtype
+                ).triu(1)
+            if has_cache:
+                key_positions = torch.arange(k_all.shape[1], device=x.device, dtype=torch.long).view(1, 1, 1, -1)
+                scores = scores + (key_positions >= self.cache_lens.view(bsz, 1, 1, 1)).to(dtype=scores.dtype) * -1e9
+            elif attention_mask is not None:
+                scores = scores + (1.0 - attention_mask.to(device=x.device, dtype=scores.dtype).unsqueeze(1).unsqueeze(2)) * -1e9
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = output * token_mask.unsqueeze(-1).to(dtype=output.dtype)
         output = self.resid_dropout(self.o_proj(output))
-        return output, past_kv
+        return output
 
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
@@ -183,15 +310,20 @@ class MiniMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ):
         residual = hidden_states
-        hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states), position_embeddings,
-            past_key_value, use_cache, attention_mask
+        hidden_states = self.self_attn(
+            self.input_layernorm(hidden_states), positions, active_mask=active_mask, attention_mask=attention_mask
         )
         hidden_states += residual
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, present_key_value
+        return hidden_states
 
 class MiniMindModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
@@ -202,91 +334,118 @@ class MiniMindModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        active_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
-        past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         hidden_states = self.dropout(self.embed_tokens(input_ids))
-        # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
-        if self.freqs_cos[0, 0] == 0:
-            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
-            self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
-        position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
-        presents = []
-        for layer, past_key_value in zip(self.layers, past_key_values):
-            hidden_states, present = layer(
-                hidden_states,
-                position_embeddings,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attention_mask=attention_mask
-            )
-            presents.append(present)
-        hidden_states = self.norm(hidden_states)
-        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
-        return hidden_states, presents, aux_loss
+        if positions is None:
+            positions = torch.arange(seq_length, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
 
-class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, positions, active_mask=active_mask, attention_mask=attention_mask)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+    def reset_kv_cache(self) -> None:
+        for layer in self.layers:
+            layer.self_attn.reset_kv_cache()
+
+class MiniMindForCausalLM(nn.Module):
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     def __init__(self, config: MiniMindConfig = None):
+        super().__init__()
         self.config = config or MiniMindConfig()
-        super().__init__(self.config)
         self.model = MiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
-        self.post_init()
 
-    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
-        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-        loss = None
-        if labels is not None:
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-            loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
-    
-    # https://github.com/jingyaogong/minimind/discussions/611
-    @torch.inference_mode()
-    def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
-        if temperature is None or temperature <= 0:
-            temperature = 1.0
-            do_sample = False
-        input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
-        attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
-        past_key_values = kwargs.pop("past_key_values", None)
-        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
-        if streamer: streamer.put(input_ids.cpu())
-        for _ in range(max_new_tokens):
-            past_len = past_key_values[0][0].shape[1] if past_key_values else 0
-            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
-            attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
-            logits = outputs.logits[:, -1, :]
-            if temperature is not None and temperature != 1.0:
-                logits = logits / float(temperature)
-            if repetition_penalty != 1.0:
-                for i in range(input_ids.shape[0]): logits[i, torch.unique(input_ids[i])] /= repetition_penalty
-            if top_k > 0: 
-                logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
-                mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
-                logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
-            next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
-            if eos_token_id is not None: next_token = torch.where(finished.unsqueeze(-1), next_token.new_full((next_token.shape[0], 1), eos_token_id), next_token)
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            past_key_values = outputs.past_key_values if use_cache else None
-            if streamer: streamer.put(next_token.cpu())
-            if eos_token_id is not None:
-                finished |= next_token.squeeze(-1).eq(eos_token_id)
-                if finished.all(): break
-        if streamer: streamer.end()
-        if kwargs.get("return_kv"): return {'generated_ids': input_ids, 'past_kv': past_key_values}
-        return input_ids
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        active_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids, positions=positions, active_mask=active_mask, attention_mask=attention_mask)
+        return hidden_states
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden_states)
+
+    def prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = self.forward(input_ids=input_ids, positions=positions, attention_mask=attention_mask)
+        logits = self.compute_logits(hidden_states)
+        if attention_mask is None:
+            return logits[:, -1, :]
+        last_valid = attention_mask.to(dtype=torch.long).sum(dim=1).clamp(min=1) - 1
+        gather_index = last_valid.view(-1, 1, 1).expand(-1, 1, logits.shape[-1])
+        return logits.gather(dim=1, index=gather_index).squeeze(1)
+
+    def decode(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = self.forward(input_ids=input_ids, positions=positions, active_mask=active_mask)
+        logits = self.compute_logits(hidden_states)
+        return logits[:, -1, :]
+
+    def reset_kv_cache(self) -> None:
+        self.model.reset_kv_cache()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_dir: str,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype | str | None = "auto",
+        strict: bool = True,
+    ) -> "MiniMindForCausalLM":
+        model_dir = os.path.expanduser(str(model_dir))
+        config_path = os.path.join(model_dir, "config.json")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        config = MiniMindConfig(**cfg)
+
+        model = cls(config)
+
+        checkpoint_path = os.path.join(model_dir, "model.safetensors")
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = os.path.join(model_dir, "pytorch_model.bin")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"no checkpoint found under {model_dir} (expected model.safetensors or pytorch_model.bin)")
+
+        try:
+            from transformers.modeling_utils import load_state_dict as _hf_load_state_dict
+
+            state_dict = _hf_load_state_dict(checkpoint_path)
+        except Exception:
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if bool(getattr(config, "tie_word_embeddings", False)):
+            # HF/Qwen-style checkpoints often omit lm_head when it is tied to embeddings.
+            missing = [k for k in missing if k != "lm_head.weight"]
+            model.lm_head.weight = model.model.embed_tokens.weight
+        if strict and (missing or unexpected):
+            raise RuntimeError(f"load_state_dict mismatch: missing={missing}, unexpected={unexpected}")
+
+        
+        if device is not None:
+            model = model.to(device=device)
+        model.eval().to(torch.bfloat16)
+        return model

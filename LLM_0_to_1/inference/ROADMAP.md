@@ -22,7 +22,48 @@
   - `NaiveKVCache`：按 request 保存 `past_key_values`，先不做分页/复用。
 - 验证：`run_engine.py` 同时提交多个 prompt，观察同一轮 step 内的批处理与吞吐变化。
 
-## 2. Continuous Batching（完善调度与状态机）
+## 2. Engine 接管生成循环（已落地）
+- 需求：将生成控制流从 `model.generate` 移到引擎，显式区分 prefill 与 decode。
+- 原理：先在引擎中完成单请求/等长 batch 的自回归控制，再逐步向更复杂的 batch 组织和调度扩展。
+- 实现点：
+  - `model_infer.py`：`forward()` 返回 hidden states，`prefill()` / `decode()` 返回 last-token logits。
+  - `engine.generate()`：prefill 一次，之后循环 decode。
+  - `run_model_infer.py`：最小验证入口，便于和 `basic.py` 对照。
+- 验证：`run_model_infer.py` 可直接加载权重并输出生成文本。
+
+## 3. Batch 状态与 KV 语义（已落地）
+- 需求：让 batch 成为一等公民，并为后续变长 batch / continuous batching 做状态准备。
+- 原理：batch 不只是一个 `(B, T)` 张量，还应包含每个 slot 的独立生命周期与 KV 生命周期。
+- 实现点：
+  - `_BatchGenerateState`：显式维护 `prompt_lens / generated_lens / finished / eos_hit / generated_token_ids`。
+  - `Attention` 维护 `k_cache / v_cache / cache_lens`。
+  - decode 通过 `active_mask` 控制活跃样本继续追加 KV，已结束样本冻结 slot。
+- 验证：batch 内不同样本在不同时间结束时，其它样本仍可继续生成。
+
+## 4. 变长 Batch（当前已落地第一版）
+- 需求：不再要求 batch 内 prompt 等长。
+- 原理：通过 `padding + attention_mask` 先打通正确性；性能优化（packed/varlen）延后。
+- 实现点：
+  - prefill 支持 `attention_mask`，并按每个样本最后一个有效 token 抽取 logits。
+  - decode 使用 `cache_lens` 限制可见历史。
+  - `run_model_infer.py` 的 batch 输入改为 `padding=True`。
+- 验证：可直接输入不同长度 prompt 组成 batch 并完成推理。
+
+## 4.5 近期执行顺序（浓缩版）
+- 阶段 A：先把当前版本做扎实
+  - 固定 `compare_infer_paths.py` 作为回归入口，持续对比 `basic.generate / engine.generate / engine.generate_batch` 的正确性、吞吐和显存。
+  - 稳定单条、等长 batch、变长 batch 的结果一致性。
+- 阶段 B：把 engine 结构向 nano-vllm 靠拢
+  - 将当前 `InferenceEngine` 逐步拆成 `Request / Scheduler / ModelRunner / KVManager` 四层。
+  - 目标是让“调度、前向执行、KV 生命周期”边界清晰，为 continuous batching 做准备。
+- 阶段 C：优先做调度能力，而不是立刻做 kernel
+  - 先实现 continuous batching，再实现 chunked prefill。
+  - 先把请求状态机、活跃样本集合、prefill/decode 交织调度理顺。
+- 阶段 D：最后再做高性能 KV 与 attention
+  - 先把 KV cache 继续外提到独立管理层，再演进到 paged/block 语义。
+  - 在此基础上再做 packed/varlen、paged attention、prefix cache。
+
+## 5. Continuous Batching（下一阶段）
 - 需求：请求随时到达；decode 批次每步都可能变化；吞吐优先。
 - 原理：把“活跃请求集合”视作一个动态队列，每步选择可运行子集；调度策略影响吞吐与尾延迟。
 - 实现点：
@@ -31,7 +72,7 @@
   - 预留：prefill 与 decode 分别调度（为 chunked prefill 做铺垫）。
 - 验证：压测脚本（固定 prompt 长度/不同到达率），输出吞吐与 P50/P99 延迟。
 
-## 3. Chunked Prefill（把 prefill 也拆成 step）
+## 6. Chunked Prefill（把 prefill 也拆成 step）
 - 需求：长 prompt 会独占算力导致短请求排队；希望长 prompt 分块并与 decode 交织。
 - 原理：prefill 可按 token chunk 分段计算并增量写入 KV（注意：需要模型支持 cache + 位置编码一致）。
 - 实现点：
@@ -40,7 +81,7 @@
   - chunk 大小自适应（受显存与吞吐影响）。
 - 验证：混合长短 prompt 的延迟曲线，观察尾延迟下降。
 
-## 4. Paged Attention（KV 分页/块管理）
+## 7. Paged Attention（KV 分页/块管理）
 - 需求：KV cache 是显存大头；需要可回收、可碎片整理、可按 token 增长分配。
 - 原理：把 KV 按固定 block/page 分配，逻辑连续序列映射到物理非连续块；attention 用 page table 做 gather。
 - 实现点（教学原型可以分两阶段）：
@@ -48,7 +89,7 @@
   - 阶段 B：实现 paged attention kernel（CUDA/Triton）+ page table gather。
 - 验证：并发请求数拉高，观察 OOM 边界提升与显存曲线更平滑。
 
-## 5. Radix Attention（前缀共享 / prefix cache）
+## 8. Radix Attention（前缀共享 / prefix cache）
 - 需求：多轮对话、检索增强等场景大量共享前缀；希望复用前缀 KV，减少 prefill。
 - 原理：用 radix tree（前缀树）存 prompt token 序列到 KV 的映射；最长公共前缀匹配后只 prefill 增量部分。
 - 实现点：
@@ -57,7 +98,7 @@
   - 与 paged KV 结合：prefix KV 对应 blocks 可共享。
 - 验证：共享前缀的 N 个请求，prefill FLOPs 与 wall-time 显著下降。
 
-## 6. PD Disaggregate（Prefill/Decode 分离）
+## 9. PD Disaggregate（Prefill/Decode 分离）
 - 需求：prefill 与 decode 的算子/并发特性不同；可用不同 GPU/不同实例；提升整体利用率。
 - 原理：把推理拆成两个服务：Prefill Service 产出 KV handle；Decode Service 消费 KV handle 继续生成。
 - 实现点（先做单机模拟，再做进程/网络）：
@@ -66,8 +107,7 @@
   - 一致性：tokenization、rope scaling、eos 等必须一致。
 - 验证：分别跑 prefill-heavy 与 decode-heavy workload，观察资源利用与吞吐改善。
 
-## 7. 可选补充（强烈建议加入）
+## 10. 可选补充（强烈建议加入）
 - 推理正确性与复现：固定随机种子、采样一致性、对齐 HF generate（小样本）。
 - 监控与可观测：step 级 timeline（prefill/decode 时间、batch size、cache hit）。
 - 基本工程化：配置文件、日志分级、基准脚本、最小单测。
-

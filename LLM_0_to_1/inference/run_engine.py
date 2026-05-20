@@ -8,10 +8,10 @@ from dataclasses import dataclass
 import torch
 from transformers import AutoTokenizer
 
-from .engine import GenerationParams, InferenceEngine
-from .engine.engine import EngineConfig
+from engine import GenerationParams, InferenceEngine
+from engine.engine import EngineConfig
 
-from .models.model import MiniMindForCausalLM
+from models.model import MiniMindForCausalLM
 
 warnings.filterwarnings("ignore")
 
@@ -268,6 +268,7 @@ def main():
         )
 
         baseline_mode = "static" if args.baseline == "static" else "single"
+        print(f"running generated static")
         r1 = _run_generate_static(
             model=model,
             tokenizer=tokenizer,
@@ -280,7 +281,7 @@ def main():
             batch_mode=baseline_mode,
             poll_sleep_s=poll_sleep_s,
         )
-
+        print(f"running generated continuous")
         r2 = _run_engine_continuous(
             model=model,
             tokenizer=tokenizer,

@@ -63,7 +63,7 @@ def main():
         inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
 
         print('🧠: ', end='')
-        st = time.time()
+        st_2 = time.time()
         generated_ids = model.generate(
             inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
             max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
@@ -74,7 +74,7 @@ def main():
         conversation.append({"role": "assistant", "content": response})
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
         total_tokens += gen_tokens
-        print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
+        print(f'\n[Speed]: {gen_tokens / (time.time() - st_2):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
     elapsed = time.time() - st
     print(f"\n总生成: {total_tokens} tokens; wall={elapsed:.2f}s; {total_tokens/elapsed:.2f} tokens/s\n")
     

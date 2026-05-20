@@ -1,0 +1,12 @@
+python run_engine.py \
+  --load_from /root/autodl-tmp/minimind/minimind-3 \
+  --use_kv_cache 1 \
+  --mode compare \
+  --max_batch_size 8 \
+  --num_requests 128 \
+  --arrival_rate 16 \
+  --arrival_process fixed \
+  --baseline static \
+  --use_pretrain_prompt 0 \
+  --temperature 0 \
+  --top_p 1.0
