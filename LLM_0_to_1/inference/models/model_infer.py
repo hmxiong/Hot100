@@ -185,7 +185,7 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xq, xk = self.q_norm(xq), self.k_norm(xk)
         xq, xk = self.rotary_emb(positions, xq, xk)
-
+        
         if attention_mask is None:
             token_mask = torch.ones((bsz, seq_len), device=x.device, dtype=torch.bool)
         else:
@@ -447,5 +447,5 @@ class MiniMindForCausalLM(nn.Module):
         
         if device is not None:
             model = model.to(device=device)
-        model.eval().to(torch.bfloat16)
+        model.eval()
         return model

@@ -50,18 +50,22 @@
 - 验证：可直接输入不同长度 prompt 组成 batch 并完成推理。
 
 ## 4.5 近期执行顺序（浓缩版）
-- 阶段 A：先把当前版本做扎实
-  - 固定 `compare_infer_paths.py` 作为回归入口，持续对比 `basic.generate / engine.generate / engine.generate_batch` 的正确性、吞吐和显存。
-  - 稳定单条、等长 batch、变长 batch 的结果一致性。
-- 阶段 B：把 engine 结构向 nano-vllm 靠拢
+- 阶段 A：当前正确性基线已完成
+  - `basic.generate`、`engine.generate`、`engine.generate_batch` 在当前测试集上已经重新对齐。
+  - `compare_infer_paths.py` 现在既是性能基线入口，也是后续 serving engine 重构的正确性回归入口。
+- 阶段 B：从“教学型引擎”过渡到“专业 serving engine”
   - 将当前 `InferenceEngine` 逐步拆成 `Request / Scheduler / ModelRunner / KVManager` 四层。
-  - 目标是让“调度、前向执行、KV 生命周期”边界清晰，为 continuous batching 做准备。
-- 阶段 C：优先做调度能力，而不是立刻做 kernel
+  - 明确职责边界：
+    - `Request`：状态机、长度、优先级、取消/完成
+    - `Scheduler`：挑选每一轮参与 prefill/decode 的请求集合
+    - `ModelRunner`：只负责执行模型前向
+    - `KVManager`：只负责 KV 分配、复用和释放
+- 阶段 C：优先完善调度与资源编排
   - 先实现 continuous batching，再实现 chunked prefill。
-  - 先把请求状态机、活跃样本集合、prefill/decode 交织调度理顺。
-- 阶段 D：最后再做高性能 KV 与 attention
-  - 先把 KV cache 继续外提到独立管理层，再演进到 paged/block 语义。
-  - 在此基础上再做 packed/varlen、paged attention、prefix cache。
+  - 先把“请求动态进入、动态退出、prefill/decode 交织”这条主线打通。
+- 阶段 D：再继续外提 KV 与 attention 形态
+  - 将 KV cache 从模型内部进一步外提到独立管理层。
+  - 再演进到 paged/block、packed/varlen、prefix cache。
 
 ## 5. Continuous Batching（下一阶段）
 - 需求：请求随时到达；decode 批次每步都可能变化；吞吐优先。
@@ -111,3 +115,15 @@
 - 推理正确性与复现：固定随机种子、采样一致性、对齐 HF generate（小样本）。
 - 监控与可观测：step 级 timeline（prefill/decode 时间、batch size、cache hit）。
 - 基本工程化：配置文件、日志分级、基准脚本、最小单测。
+
+## 11. 当前阶段结论
+- 已完成：
+  - `model_infer` 与 `model.py` 前向对齐
+  - `engine.generate` 与 `basic.generate` 输出对齐
+  - `engine.generate_batch` 与 `basic.generate` 在当前 8 条 prompt 测试集上输出对齐
+- 当前代表性结果：
+  - `basic.generate`: `2022 tokens / 11.18s / 180.87 tokens/s`
+  - `engine.generate_batch`: `2022 tokens / 3.89s / 519.31 tokens/s`
+- 现阶段主问题：
+  - 单条 `engine.generate` 仍慢于 `basic.generate`
+  - 当前 batch 能力仍是“静态 batch + 规则张量 KV”，离真正的专业 serving engine 还有调度与内存管理差距

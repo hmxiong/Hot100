@@ -1,7 +1,5 @@
 [generate_static] total=33365 tokens; wall=38.07s; throughput=876.47 tokens/s; latency_p50=16.909s; p90=28.480s; p99=30.425s
 [engine_continuous] total=31663 tokens; wall=246.61s; throughput=128.39 tokens/s; latency_p50=124.400s; p90=221.011s; p99=238.405s
 
-[engine_continuous] total=30605 tokens; wall=54.25s; throughput=564.14 tokens/s; latency_p50=21.221s; p90=37.547s; p99=46.199s
-
 
 python run_engine.py --load_from /data0/l30081456/x50057374/minimind/minimind-3 --use_kv_cache 1 --mode compare --max_batch_size 8 --num_requests 128 --arrival_rate 16 --arrival_process fixed --baseline static --use_pretrain_prompt 0

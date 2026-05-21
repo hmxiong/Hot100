@@ -18,6 +18,14 @@
   - paged attention
   - radix / prefix cache
 
+### 1.1 当前阶段结论
+- `model_infer.py` 的 full forward 已经与原始 `model.py` 对齐。
+- `engine.generate()` 的 cache decode 路径已经与 `basic.generate()` 对齐。
+- 当前 8 条 prompt 的对比结果显示：
+  - `basic.generate` 与 `engine.generate_batch` 文本输出一致
+  - `per_prompt_tokens` 一致
+  - 当前主要矛盾已经从“正确性对齐”切回“性能与架构演进”
+
 ## 2. 当前模块划分
 
 ### 2.1 模型层：`models/model_infer.py`
@@ -35,6 +43,14 @@
     - `v_cache`
     - `cache_lens`
   - `cache_lens` 表示每个 batch slot 当前的有效历史长度。
+- 当前约束：
+  - `from_pretrained()` 不再提前固定 dtype。
+  - 模型加载阶段只负责：
+    - 配置读取
+    - 权重加载
+    - tie embedding 处理
+    - `eval()`
+  - 运行 dtype 统一由外层初始化逻辑控制，避免权重在 `bf16 -> fp16` 间重复转换导致对齐偏差。
 
 ### 2.2 引擎层：`engine/engine.py`
 - `InferenceEngine` 是当前生成控制流的核心。
@@ -56,11 +72,17 @@
   - 作为当前 `model_infer + engine` 的最小验证入口
   - 支持单条和 batch 推理
 - `compare_infer_paths.py`
-  - 统一对比三条路径：
+  - 统一对比以下路径：
     - `basic.generate`
+    - `basic.generate_batch`
     - `engine.generate`
     - `engine.generate_batch`
-  - 输出吞吐与显存指标
+  - 输出吞吐、显存与逐层/逐步诊断信息
+  - 当前额外支持：
+    - `diagnose`
+    - `diagnose_forward`
+    - `diagnose_layers`
+    - `diagnose_attention`
 
 ## 3. 当前生成路径
 
@@ -185,15 +207,25 @@
 - KV cache 具备 batch slot 语义
 - positions 显式化
 - attention_mask / 变长 batch 第一版打通
+- 正确性回归链路已经建立，可在结构改动后快速验证 basic/engine 是否仍对齐
 
 ## 8. 当前建议的演进顺序
-1. 稳定当前变长 batch 正确性
-2. 完善 continuous batching 状态机
-3. 引入 chunked prefill
-4. 将 KV cache 继续外提，演进到 paged / block 语义
-5. 再做 prefix cache / radix attention
+1. 固化“正确性优先”的 serving baseline
+2. 将当前 `InferenceEngine` 拆分为 `Request / Scheduler / ModelRunner / KVManager`
+3. 在此基础上实现 continuous batching
+4. 引入 chunked prefill，打通 prefill/decode 混合调度
+5. 将 KV cache 从模型内部继续外提，演进到 paged / block 语义
+6. 再做 prefix cache / radix attention
 
-## 9. 当前设计的刻意限制
+## 9. 现阶段的 serving 目标
+- 当前目标不再只是“一个能跑 batch inference 的教学 demo”，而是“一个结构清晰、可验证、可逐步接近 vLLM/SGLang 的 serving engine 原型”。
+- 接下来更关注的能力包括：
+  - request 生命周期管理
+  - scheduler 驱动的动态活跃集合
+  - prefill/decode 资源分治
+  - KV 生命周期外提
+  - 稳定的吞吐/延迟/显存观测
+## 10. 当前设计的刻意限制
 - 当前重点仍是“教学可控、路径清晰”，不是“一步到位复刻 vLLM”。
 - 当前 KV 还在模型内部维护，没有完全外提到独立的 cache manager。
 - 当前 decode 仍保持固定 batch slot，不做活跃样本压缩。
