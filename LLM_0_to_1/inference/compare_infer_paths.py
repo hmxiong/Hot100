@@ -74,6 +74,34 @@ def build_text(tokenizer, prompt: str, use_chat_template: bool, open_thinking: b
     return (getattr(tokenizer, "bos_token", None) or "") + prompt
 
 
+def select_equal_length_texts(
+    tokenizer,
+    prompts: list[str],
+    texts: list[str],
+    min_batch_size: int = 2,
+) -> tuple[list[str], list[str], int]:
+    if len(prompts) != len(texts):
+        raise ValueError("prompts 与 texts 长度不一致")
+
+    buckets: dict[int, list[int]] = {}
+    for i, text in enumerate(texts):
+        encoded = tokenizer(text, return_tensors="pt", truncation=True)
+        token_len = int(encoded["input_ids"].shape[1])
+        buckets.setdefault(token_len, []).append(i)
+
+    candidates = [(token_len, idxs) for token_len, idxs in buckets.items() if len(idxs) >= int(min_batch_size)]
+    if not candidates:
+        bucket_sizes = {token_len: len(idxs) for token_len, idxs in buckets.items()}
+        raise ValueError(
+            f"找不到满足最小 batch 大小的等长 prompt 子集，min_batch_size={min_batch_size}, buckets={bucket_sizes}"
+        )
+
+    best_len, best_indices = sorted(candidates, key=lambda x: (-len(x[1]), -x[0], x[0]))[0]
+    selected_prompts = [prompts[i] for i in best_indices]
+    selected_texts = [texts[i] for i in best_indices]
+    return selected_prompts, selected_texts, int(best_len)
+
+
 def init_basic_model(load_from: str, device: str, dtype: torch.dtype):
     model = BasicMiniMindForCausalLM.from_pretrained(load_from, trust_remote_code=True)
     model = model.eval().to(device=device, dtype=dtype)
@@ -129,6 +157,71 @@ def benchmark_basic_generate(
     peak_alloc, peak_reserved = collect_cuda_peaks(device)
     return {
         "name": "basic.generate",
+        "responses": responses,
+        "per_prompt_tokens": per_prompt_tokens,
+        "total_tokens": total_tokens,
+        "wall_s": wall_s,
+        "throughput_tps": (total_tokens / wall_s) if wall_s > 0 else 0.0,
+        "baseline_alloc_mb": baseline_alloc,
+        "baseline_reserved_mb": baseline_reserved,
+        "peak_alloc_mb": peak_alloc,
+        "peak_reserved_mb": peak_reserved,
+    }
+
+
+def benchmark_basic_generate_batch(
+    model,
+    tokenizer,
+    texts: list[str],
+    device: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+) -> dict:
+    encoded = [tokenizer(text, return_tensors="pt", truncation=True) for text in texts]
+    prompt_lens = [int(x["input_ids"].shape[1]) for x in encoded]
+    if len(set(prompt_lens)) != 1:
+        raise ValueError(
+            f"benchmark_basic_generate_batch 要求 batch 内长度一致，当前 prompt_lens={prompt_lens}"
+        )
+
+    batch_inputs = tokenizer(texts, return_tensors="pt", truncation=True, padding=True).to(device)
+    baseline_alloc, baseline_reserved = reset_cuda_stats(device)
+    maybe_sync(device)
+    st = time.time()
+    basic_top_p = float(top_p) if temperature is not None and temperature > 0 else 1.0
+    basic_top_k = 50 if temperature is not None and temperature > 0 else 0
+    outputs = model.generate(
+        inputs=batch_inputs["input_ids"],
+        attention_mask=batch_inputs.get("attention_mask"),
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=basic_top_p,
+        top_k=basic_top_k,
+        repetition_penalty=repetition_penalty,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        do_sample=bool(temperature > 0),
+        use_cache=True,
+    )
+    maybe_sync(device)
+    wall_s = time.time() - st
+    peak_alloc, peak_reserved = collect_cuda_peaks(device)
+
+    prompt_width = int(batch_inputs["input_ids"].shape[1])
+    responses: list[str] = []
+    total_tokens = 0
+    per_prompt_tokens: list[int] = []
+    for i in range(outputs.shape[0]):
+        response_ids = outputs[i][prompt_width:]
+        gen_len = int(response_ids.shape[0])
+        total_tokens += gen_len
+        per_prompt_tokens.append(gen_len)
+        responses.append(tokenizer.decode(response_ids, skip_special_tokens=True))
+
+    return {
+        "name": "basic.generate_batch",
         "responses": responses,
         "per_prompt_tokens": per_prompt_tokens,
         "total_tokens": total_tokens,
@@ -269,20 +362,25 @@ def print_summary(result: dict) -> None:
     )
     if "per_prompt_tokens" in result:
         print(f"per_prompt_tokens={result['per_prompt_tokens']}")
+    if "note" in result and result["note"]:
+        print(f"note={result['note']}")
 
 
 def print_outputs(prompts: list[str], results: list[dict]) -> None:
     print("\n### Outputs")
-    for i, prompt in enumerate(prompts):
-        print(f"[{i}] Prompt: {prompt}")
-        for result in results:
-            print(f"{result['name']}:")
+    for result in results:
+        result_prompts = result.get("prompts", prompts)
+        print(f"\n[{result['name']}]")
+        for i, prompt in enumerate(result_prompts):
+            print(f"[{i}] Prompt: {prompt}")
             print(result["responses"][i])
-        print()
+            print()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="对比 basic.generate / engine.generate / engine.generate_batch")
+    parser = argparse.ArgumentParser(
+        description="对比 basic.generate / basic.generate_batch / engine.generate / engine.generate_batch"
+    )
     parser.add_argument("--load_from", default="/root/autodl-tmp/minimind/minimind-3", type=str)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str)
     parser.add_argument("--max_new_tokens", default=64, type=int)
@@ -294,10 +392,12 @@ def main():
     parser.add_argument("--open_thinking", default=0, type=int, choices=[0, 1])
     parser.add_argument("--num_prompts", default=4, type=int)
     parser.add_argument("--prompts", default="", type=str, help="自定义 prompt，使用 || 分隔")
+    parser.add_argument("--auto_select_equal_length", default=1, type=int, choices=[0, 1])
+    parser.add_argument("--min_equal_batch_size", default=2, type=int)
     parser.add_argument(
         "--mode",
         default="all",
-        choices=["all", "basic", "engine", "engine_batch"],
+        choices=["all", "basic", "basic_batch", "engine", "engine_batch"],
         help="选择运行哪一条路径；分别运行时可得到更干净的显存/吞吐数据",
     )
     parser.add_argument("--show_outputs", default=1, type=int, choices=[0, 1])
@@ -320,6 +420,7 @@ def main():
     results = []
 
     run_basic = args.mode in ("all", "basic")
+    run_basic_batch = args.mode in ("all", "basic_batch")
     run_engine = args.mode in ("all", "engine")
     run_engine_batch = args.mode in ("all", "engine_batch")
 
@@ -336,8 +437,40 @@ def main():
             repetition_penalty=float(args.repetition_penalty),
         )
         results.append(result)
+        result["prompts"] = prompts
         print_summary(result)
         cleanup_model(basic_model)
+
+    if run_basic_batch:
+        batch_prompts = prompts
+        batch_texts = texts
+        batch_note = ""
+        if int(args.auto_select_equal_length):
+            batch_prompts, batch_texts, token_len = select_equal_length_texts(
+                tokenizer=tokenizer,
+                prompts=prompts,
+                texts=texts,
+                min_batch_size=int(args.min_equal_batch_size),
+            )
+            batch_note = (
+                f"auto_selected_equal_length_batch: batch_size={len(batch_texts)}, token_len={token_len}"
+            )
+        basic_model_batch = init_basic_model(args.load_from, args.device, dtype)
+        result = benchmark_basic_generate_batch(
+            model=basic_model_batch,
+            tokenizer=tokenizer,
+            texts=batch_texts,
+            device=args.device,
+            max_new_tokens=int(args.max_new_tokens),
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            repetition_penalty=float(args.repetition_penalty),
+        )
+        results.append(result)
+        result["prompts"] = batch_prompts
+        result["note"] = batch_note
+        print_summary(result)
+        cleanup_model(basic_model_batch)
 
     if run_engine:
         infer_model_single = init_infer_model(args.load_from, args.device, dtype)
@@ -352,6 +485,7 @@ def main():
             repetition_penalty=float(args.repetition_penalty),
         )
         results.append(result)
+        result["prompts"] = prompts
         print_summary(result)
         cleanup_model(infer_model_single)
 
@@ -368,6 +502,7 @@ def main():
             repetition_penalty=float(args.repetition_penalty),
         )
         results.append(result)
+        result["prompts"] = prompts
         print_summary(result)
         cleanup_model(infer_model_batch)
 
