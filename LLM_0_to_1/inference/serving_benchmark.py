@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 
 from engine import GenerationParams, InferenceEngine
 from engine.engine import EngineConfig
+from engine.request import RequestStatus
 from models.model import MiniMindForCausalLM as BasicMiniMindForCausalLM
 from models.model_infer import MiniMindForCausalLM
 
@@ -175,6 +176,21 @@ def _build_result(
     )
 
 
+def _count_generated_tokens_from_outputs(
+    output_ids: torch.Tensor,
+    prompt_width: int,
+    pad_token_id: int | None,
+) -> int:
+    if output_ids.dim() != 1:
+        raise ValueError(f"output_ids 期望为 1D，实际 shape={tuple(output_ids.shape)}")
+    suffix = output_ids[int(prompt_width):]
+    if suffix.numel() == 0:
+        return 0
+    if pad_token_id is None:
+        return int(suffix.shape[0])
+    return int((suffix != int(pad_token_id)).sum().item())
+
+
 def _run_generate_scheduler(
     name: str,
     model,
@@ -231,13 +247,21 @@ def _run_generate_scheduler(
         finish_t = time.time()
 
         attn = inputs.get("attention_mask", None)
+        prompt_width = int(inputs["input_ids"].shape[1])
         for row, idx in enumerate(batch_indices):
             if attn is None:
                 prompt_len = int(inputs["input_ids"][row].shape[0])
             else:
                 prompt_len = int(attn[row].sum().item())
-            out_len = int(outputs[row].shape[0])
-            gen_len = max(out_len - prompt_len, 0)
+            if name == "hf_batch":
+                gen_len = _count_generated_tokens_from_outputs(
+                    output_ids=outputs[row],
+                    prompt_width=prompt_width,
+                    pad_token_id=params.pad_token_id,
+                )
+            else:
+                out_len = int(outputs[row].shape[0])
+                gen_len = max(out_len - prompt_len, 0)
             request_stats.append(
                 RequestStat(
                     idx=idx,
@@ -406,19 +430,23 @@ def _run_engine_continuous(
     finish_wall: dict[str, float] = {}
     finished: set[str] = set()
     generated_tokens: dict[str, int] = {}
+    batch_sizes: list[int] = []
 
     while len(finished) < len(prompts):
         now = time.time()
         t = now - start_wall
         while next_idx < len(prompts) and arrivals[next_idx] <= t:
-            rid = engine.add_request(prompts[next_idx], params=params)
+            rid = engine.add_request(prompts[next_idx], sampling_params=params)
             request_ids.append(rid)
             request_to_idx[rid] = next_idx
             arrival_wall[rid] = start_wall + arrivals[next_idx]
-            dispatch_wall[rid] = time.time()
             next_idx += 1
 
-        progressed = int(engine.step())
+        _, num_tokens = engine.step()
+        progressed = abs(int(num_tokens))
+        running_now = getattr(engine.scheduler, "running", [])
+        if running_now:
+            batch_sizes.append(len(running_now))
         if progressed == 0:
             time.sleep(poll_sleep_s)
 
@@ -428,6 +456,8 @@ def _run_engine_continuous(
             req = engine.get_request(rid)
             if req is None:
                 continue
+            if rid not in dispatch_wall and req.status != RequestStatus.WAITING:
+                dispatch_wall[rid] = time.time()
             gen_len = int(len(req.generated_ids))
             if gen_len > 0 and rid not in first_token_wall:
                 first_token_wall[rid] = time.time()
@@ -446,7 +476,7 @@ def _run_engine_continuous(
             RequestStat(
                 idx=request_to_idx[rid],
                 arrival_s=arrival_wall[rid],
-                dispatch_s=dispatch_wall[rid],
+                dispatch_s=dispatch_wall.get(rid, finish_t),
                 first_token_s=first_t,
                 finish_s=finish_t,
                 generated_tokens=int(generated_tokens.get(rid, 0)),
@@ -457,11 +487,12 @@ def _run_engine_continuous(
         name="engine_continuous",
         start_wall=start_wall,
         request_stats=sorted(stats, key=lambda x: x.idx),
-        batch_sizes=[],
+        batch_sizes=batch_sizes,
         baseline_alloc_mb=baseline_alloc,
         baseline_reserved_mb=baseline_reserved,
         peak_alloc_mb=peak_alloc,
         peak_reserved_mb=peak_reserved,
+        note="当前 continuous 路径基于 refillable shrinking-batch + rebuild-on-refill，dispatch/ttft 为近似统计",
     )
 
 

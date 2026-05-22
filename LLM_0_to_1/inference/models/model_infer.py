@@ -160,6 +160,25 @@ class Attention(nn.Module):
         cache_keep = keep_tensor.to(device=self.cache_lens.device)
         self.cache_lens = self.cache_lens.index_select(0, cache_keep).contiguous()
 
+    def append_empty_kv_cache(self, num_new_rows: int) -> None:
+        if int(num_new_rows) <= 0:
+            return
+        if self.k_cache.numel() == 0 or self.v_cache.numel() == 0:
+            return
+        old_batch, cache_len = int(self.k_cache.shape[0]), int(self.k_cache.shape[1])
+        new_batch = old_batch + int(num_new_rows)
+        k_all = self.k_cache.new_zeros((new_batch, cache_len, self.n_local_kv_heads, self.head_dim))
+        v_all = self.v_cache.new_zeros((new_batch, cache_len, self.n_local_kv_heads, self.head_dim))
+        if old_batch > 0:
+            k_all[:old_batch] = self.k_cache
+            v_all[:old_batch] = self.v_cache
+        cache_lens = self.cache_lens.new_zeros((new_batch,))
+        if self.cache_lens.numel() > 0:
+            cache_lens[:old_batch] = self.cache_lens
+        self.k_cache = k_all
+        self.v_cache = v_all
+        self.cache_lens = cache_lens
+
     def check_kv_cache(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> bool:
         if self.k_cache.numel() == 0 or self.v_cache.numel() == 0:
             return False
@@ -375,6 +394,10 @@ class MiniMindModel(nn.Module):
         for layer in self.layers:
             layer.self_attn.compact_kv_cache(keep_indices)
 
+    def append_empty_kv_cache(self, num_new_rows: int) -> None:
+        for layer in self.layers:
+            layer.self_attn.append_empty_kv_cache(num_new_rows)
+
 class MiniMindForCausalLM(nn.Module):
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -427,6 +450,9 @@ class MiniMindForCausalLM(nn.Module):
 
     def compact_kv_cache(self, keep_indices: list[int] | torch.Tensor) -> None:
         self.model.compact_kv_cache(keep_indices)
+
+    def append_empty_kv_cache(self, num_new_rows: int) -> None:
+        self.model.append_empty_kv_cache(num_new_rows)
 
     @classmethod
     def from_pretrained(

@@ -222,3 +222,75 @@
     - 空位补新请求
     - prefill/decode 共存调度
     - 真正的 continuous batching
+
+### 修复：`max_batch_size` 未真正传递到 `SimpleScheduler`
+- 现象
+  - 在 `verify_refill_batch.py` 的第一次运行中，虽然命令行传入了 `--max_batch_size 4`，但 trace 的 `step 0` 仍然出现：
+    - `waiting 6->0`
+    - `running 0->6`
+  - 这说明 `scheduler.max_num_seqs` 仍然使用的是默认值，而没有真正受 `EngineConfig.max_batch_size` 约束。
+- 改动
+  - 在 `InferenceEngine.__init__()` 中，不再直接构造 `SimpleScheduler()`，而是显式传入：
+    - `SchedulerConfig(max_batch_size=config.max_batch_size)`
+- 验证
+  - 修复后，`verify_refill_batch.py` 的 `step 0` 变为：
+    - `waiting 6->2`
+    - `running 0->4`
+  - 说明 batch 容量控制已经真正生效
+
+### 定位问题：第一版 refill 队列对了，但输出又分叉
+- 现象
+  - 修复 `max_batch_size` 之后，trace 已经能正确看到：
+    - 初始只进入 4 条请求
+    - shrink 后 `admitted_now=[4]`
+    - 再次 shrink 后 `admitted_now=[5]`
+  - 但最终输出重新与 reference 分叉。
+- 根因
+  - 第一版 refill 实现采用的是“mixed prefill”：
+    - 将旧 `running` 请求的 pending token
+    - 与新补入请求的完整 prompt
+    - 放在同一轮 prefill 中混合执行
+  - 在当前 `model_infer.py` 的 attention 语义下，这种 `has_cache=True + q_len 不同 + 新旧样本混合` 的场景并不成立。
+  - 结果是：
+    - 队列行为正确
+    - 但旧样本在 refill 那一轮开始丢失正确上下文，最终生成漂移
+
+### 修复：第一版 refill 改为“rebuild current running KV”
+- 改动
+  - `scheduler.schedule()` 不再在 refill 时返回 mixed prefill，而是新增第三种 step 形态：
+    - `prefill`
+    - `decode`
+    - `rebuild`
+  - `model_runner.py` 新增 `prepare_rebuild()`，使用当前 `running` 集合每条序列的完整 `token_ids` 历史重建输入。
+  - `engine.step()` 在 `rebuild` 时会：
+    - 先 `reset_kv_cache()`
+    - 再对当前 `running` 集合整体重建 KV
+- 动机
+  - 这不是最终高性能方案，但它是当前最稳妥的“正确性优先” refill 方案。
+  - 它避免了当前 attention 还不支持的 mixed prefill 语义，先把“补请求后仍然对齐”这件事彻底打通。
+- 验证
+  - 重新运行：
+    - `python verify_refill_batch.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 4 --num_prompts 6 --max_new_tokens 64 --per_prompt_max_new_tokens 4,8,16,32,6,10 --temperature 0 --top_p 1.0 --show_outputs 1`
+  - 结果显示：
+    - `step 0`: `waiting 6->2`, `running 0->4`
+    - `step 4`: `admitted_now=[4]`
+    - `step 8`: `admitted_now=[5]`
+    - `shrink_happened=True`
+    - `refill_happened=True`
+    - 最终 6 条输出全部与 `reference engine.generate_batch` 完全一致
+
+### 阶段性结论：第一版 refillable shrinking-batch 已闭环
+- 当前状态
+  - 当前系统已经具备：
+    - shrinking-batch scheduler
+    - KV compaction
+    - refillable shrinking-batch
+  - 其中 refill 这一步当前采用的是：
+    - `correctness-first rebuild-on-refill`
+- 含义
+  - 我们已经从“只会 shrink”正式推进到“会 shrink，也会 refill”。
+  - 这为后续继续演进到：
+    - prefill/decode 混合调度
+    - chunked prefill
+    - 更正式的 continuous batching
+    提供了稳定基线。

@@ -9,7 +9,7 @@ import torch
 from .kv_cache import KVCache, KVCacheView, NaiveKVCache
 from .request import GenerationParams, Request, RequestStatus
 from .sampler import sample_next_token
-from .scheduler import SimpleScheduler, Sequence
+from .scheduler import SchedulerConfig, SimpleScheduler, Sequence
 from .model_runner import SimpleModelRunner
 
 
@@ -48,7 +48,11 @@ class InferenceEngine:
         self.config = config
         self.kv_cache = kv_cache or NaiveKVCache()
 
-        self.scheduler = SimpleScheduler()
+        self.scheduler = SimpleScheduler(
+            SchedulerConfig(
+                max_batch_size=int(config.max_batch_size),
+            )
+        )
         self.model_runner = SimpleModelRunner(model)
 
         self._waiting: list[Request] = []
@@ -57,6 +61,7 @@ class InferenceEngine:
         self._requests: dict[str, Request] = {}
         self._decode_groups: list[_DecodeGroup] = []
         self._last_batch_state: _BatchGenerateState | None = None
+        self._seqs: dict[str, Sequence] = {}
 
     def _init_batch_state(self, input_ids: torch.Tensor) -> _BatchGenerateState:
         batch_size, prompt_len = input_ids.shape
@@ -197,9 +202,45 @@ class InferenceEngine:
         input_ids = self.tokenizer.encode(prompt)
         seq = Sequence(input_ids, sampling_params)
         self.scheduler.add(seq)
+        request_id = str(seq.seq_id)
+        self._seqs[request_id] = seq
+        return request_id
     
     def is_finished(self):
         return self.scheduler.is_finished()
+
+    def get_request(self, request_id: str) -> Request | None:
+        seq = self._seqs.get(str(request_id))
+        if seq is None:
+            return None
+        status = RequestStatus.RUNNING
+        if seq.status.name == "WAITING":
+            status = RequestStatus.WAITING
+        elif seq.status.name == "FINISHED":
+            status = RequestStatus.FINISHED
+        prompt_ids = torch.tensor(seq.token_ids[: seq.num_prompt_tokens], dtype=torch.long)
+        attention_mask = torch.ones_like(prompt_ids, dtype=torch.long)
+        return Request(
+            request_id=str(request_id),
+            input_ids=prompt_ids,
+            attention_mask=attention_mask,
+            params=GenerationParams(
+                max_new_tokens=seq.max_tokens,
+                temperature=seq.temperature,
+                top_p=seq.top_p,
+                repetition_penalty=seq.repetition_penalty,
+                eos_token_id=seq.eos_token_id,
+                ignore_eos=seq.ignore_eos,
+            ),
+            prompt_len=seq.num_prompt_tokens,
+            status=status,
+            generated_ids=list(seq.completion_token_ids),
+        )
+
+    def _append_empty_model_kv_rows(self, num_new_rows: int) -> None:
+        append_fn = getattr(self.model, "append_empty_kv_cache", None)
+        if callable(append_fn) and int(num_new_rows) > 0:
+            append_fn(int(num_new_rows))
 
     def _compact_model_kv_cache_for_running(self, seqs: list[Sequence]) -> None:
         compact_fn = getattr(self.model, "compact_kv_cache", None)
@@ -217,11 +258,22 @@ class InferenceEngine:
     
     def step(self):
         # 单个step需要检测batch队列中所有序列的状态，并根据状态决定处于running还是waiting
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.run(seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        if (not is_prefill) and seqs:
+        running_before_ids = [seq.seq_id for seq in self.scheduler.running]
+        seqs, step_kind = self.scheduler.schedule()
+        if not seqs:
+            return [], 0
+        if step_kind == "rebuild":
+            reset_fn = getattr(self.model, "reset_kv_cache", None)
+            if callable(reset_fn):
+                reset_fn()
+        elif step_kind == "prefill" and running_before_ids:
+            running_before_set = set(running_before_ids)
+            num_new_rows = sum(1 for seq in seqs if seq.seq_id not in running_before_set)
+            self._append_empty_model_kv_rows(num_new_rows)
+        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if step_kind != "decode" else -len(seqs)
+        token_ids = self.model_runner.run(seqs, step_kind)
+        self.scheduler.postprocess(seqs, token_ids, step_kind)
+        if step_kind != "rebuild" and seqs:
             self._compact_model_kv_cache_for_running(seqs)
 
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]

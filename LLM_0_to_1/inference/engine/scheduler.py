@@ -75,46 +75,65 @@ class SimpleScheduler:
         return not self.waiting and not self.running
     
     def schedule(self):
-        scheduled_seqs = []
-        num_batched_tokens = 0
+        running_seqs = list(self.running)[: self.max_num_seqs]
 
-        # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            # 检测每一个 waiting 队列中的状态，符合则放入scheduled_seqs
-            seq = self.waiting[0]
-            # 检测对于当前队列中总的还需要生成多少个token
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
-                break
-            
-            # 对于单个序列而言，生成的token - cached token数量
-            num_tokens = seq.num_tokens - seq.num_cached_tokens
-            
-            # 如果总的剩余数量 < 单个序列需要生成的数量，当前基本不会触发
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
-            
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
+        # refill / rebuild:
+        # when there are free running slots and waiting requests, admit new requests
+        # and rebuild KV for the whole running set using full sequence histories.
+        if self.waiting and 0 < len(running_seqs) < self.max_num_seqs:
+            scheduled_seqs = list(running_seqs)
+            num_batched_tokens = sum(seq.num_tokens for seq in scheduled_seqs)
+            admitted_new = 0
+            free_slots = self.max_num_seqs - len(running_seqs)
 
-            num_batched_tokens += seq.num_scheduled_tokens
-
-            # 检测单个序列的状态，符合检测之后则进入running队列
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+            while self.waiting and admitted_new < free_slots:
+                seq = self.waiting[0]
+                remaining = self.max_num_batched_tokens - num_batched_tokens
+                if remaining <= 0:
+                    break
+                if seq.num_tokens > remaining and scheduled_seqs:
+                    break
+                seq.num_scheduled_tokens = seq.num_tokens
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
-            scheduled_seqs.append(seq)
+                scheduled_seqs.append(seq)
+                num_batched_tokens += seq.num_tokens
+                admitted_new += 1
 
-        # scheduled_seqs 装满，进入后续prefill过程
-        if scheduled_seqs:
-            return scheduled_seqs, True
+            if admitted_new > 0:
+                for seq in running_seqs:
+                    seq.num_scheduled_tokens = seq.num_tokens
+                return scheduled_seqs, "rebuild"
+
+        # initial prefill
+        if self.waiting and not running_seqs:
+            scheduled_seqs = []
+            num_batched_tokens = 0
+            while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+                seq = self.waiting[0]
+                remaining = self.max_num_batched_tokens - num_batched_tokens
+                if remaining == 0:
+                    break
+                num_tokens = seq.num_tokens - seq.num_cached_tokens
+                if remaining < num_tokens and scheduled_seqs:
+                    break
+                seq.num_scheduled_tokens = min(num_tokens, remaining)
+                num_batched_tokens += seq.num_scheduled_tokens
+                if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                    seq.status = SequenceStatus.RUNNING
+                    self.waiting.popleft()
+                    self.running.append(seq)
+                scheduled_seqs.append(seq)
+            if scheduled_seqs:
+                return scheduled_seqs, "prefill"
 
         # decode
         decode_seqs = list(self.running)[: self.max_num_seqs]
         for seq in decode_seqs:
             seq.num_scheduled_tokens = 1
             seq.status = SequenceStatus.RUNNING
-        return decode_seqs, False
+        return decode_seqs, "decode"
 
     def _finish_sequence(self, seq: Sequence) -> None:
         seq.status = SequenceStatus.FINISHED
@@ -132,13 +151,26 @@ class SimpleScheduler:
             return True
         return False
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool) -> None:
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int], step_kind: str) -> None:
         if len(seqs) != len(token_ids):
             raise ValueError(f"postprocess length mismatch: len(seqs)={len(seqs)} len(token_ids)={len(token_ids)}")
 
-        if is_prefill:
+        if step_kind == "prefill":
             for seq, token_id in zip(seqs, token_ids):
                 seq.num_cached_tokens += int(seq.num_scheduled_tokens)
+                seq.num_scheduled_tokens = 0
+                if seq.status != SequenceStatus.RUNNING:
+                    continue
+                seq.token_ids.append(int(token_id))
+                seq.last_token = int(token_id)
+                seq.num_tokens += 1
+                seq.is_prefill = False
+                self._maybe_finish_after_sampling(seq, int(token_id))
+            return
+
+        if step_kind == "rebuild":
+            for seq, token_id in zip(seqs, token_ids):
+                seq.num_cached_tokens = seq.num_tokens
                 seq.num_scheduled_tokens = 0
                 if seq.status != SequenceStatus.RUNNING:
                     continue

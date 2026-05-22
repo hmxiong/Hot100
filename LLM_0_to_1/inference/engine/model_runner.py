@@ -69,6 +69,41 @@ class SimpleModelRunner:
             "attention_mask": attention_mask,
         }
 
+    def prepare_rebuild(self, seqs: list[Sequence]):
+        if not seqs:
+            raise ValueError("prepare_rebuild requires at least one sequence")
+
+        batch_input_ids = []
+        batch_positions = []
+        batch_attention_mask = []
+        max_seq_len = 0
+
+        for seq in seqs:
+            token_chunk = seq.token_ids[: seq.num_tokens]
+            seq_len = len(token_chunk)
+            if seq_len <= 0:
+                raise ValueError(f"sequence {seq.seq_id} has empty token history during rebuild")
+            position_chunk = list(range(seq_len))
+            batch_input_ids.append(token_chunk)
+            batch_positions.append(position_chunk)
+            batch_attention_mask.append([1] * seq_len)
+            max_seq_len = max(max_seq_len, seq_len)
+
+        padded_input_ids = []
+        padded_positions = []
+        padded_attention_mask = []
+        for token_chunk, position_chunk, attn_chunk in zip(batch_input_ids, batch_positions, batch_attention_mask):
+            pad_len = max_seq_len - len(token_chunk)
+            padded_input_ids.append(token_chunk + [0] * pad_len)
+            padded_positions.append(position_chunk + [0] * pad_len)
+            padded_attention_mask.append(attn_chunk + [0] * pad_len)
+
+        return {
+            "input_ids": self._to_device(torch.tensor(padded_input_ids, dtype=torch.int64)),
+            "positions": self._to_device(torch.tensor(padded_positions, dtype=torch.int64)),
+            "attention_mask": self._to_device(torch.tensor(padded_attention_mask, dtype=torch.long)),
+        }
+
     def prepare_decode(self, seqs: list[Sequence]):
         if not seqs:
             raise ValueError("prepare_decode requires at least one sequence")
@@ -106,8 +141,8 @@ class SimpleModelRunner:
         return temperatures
     
     @torch.inference_mode()
-    def run_model(self, model_inputs: dict[str, torch.Tensor], is_prefill: bool):
-        if is_prefill:
+    def run_model(self, model_inputs: dict[str, torch.Tensor], step_kind: str):
+        if step_kind in ("prefill", "rebuild"):
             return self.model.prefill(
                 input_ids=model_inputs["input_ids"],
                 positions=model_inputs["positions"],
@@ -119,9 +154,14 @@ class SimpleModelRunner:
             active_mask=model_inputs.get("active_mask"),
         )
 
-    def run(self, seqs: list[Sequence], is_prefill: bool):
-        model_inputs = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence], step_kind: str):
+        if step_kind == "prefill":
+            model_inputs = self.prepare_prefill(seqs)
+        elif step_kind == "rebuild":
+            model_inputs = self.prepare_rebuild(seqs)
+        else:
+            model_inputs = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs)
-        logits = self.run_model(model_inputs, is_prefill)
+        logits = self.run_model(model_inputs, step_kind)
         token_ids = self.sampler(logits, temperatures).tolist()
         return token_ids

@@ -66,6 +66,9 @@
   - `SimpleScheduler`
   - `SimpleModelRunner`
 - 这条路径的作用不是替代现有 `generate_batch()`，而是作为 shrinking batch / continuous batching 的实验场。
+- 当前还新增了第一版 refill 能力：
+  - 当 `running` 收缩后，如果 `waiting` 中仍有请求且 batch 未满，就允许补入新请求
+  - 当前 refill 采用“正确性优先”的 `rebuild-on-refill`
 - 当前公开的生成接口：
   - `generate()`：单条或 `B=1` 路径
   - `generate_batch()`：batch 路径
@@ -188,7 +191,38 @@
 - 这一步的意义是：
   - 让“调度层删除样本”和“模型层保留剩余样本历史”第一次真正闭环
 
-### 5.5 为什么这样设计
+### 5.5 refillable shrinking-batch 过程中暴露出的新问题
+- 在继续往“空位补请求”推进时，第一版实现曾尝试走 mixed prefill：
+  - 旧 `running` 请求的 pending token
+  - 新补入请求的完整 prompt
+  - 在同一轮 prefill 中混合执行
+- 这在当前 attention 语义下会失败，因为：
+  - 当前实现虽然已经支持 `has_cache=True`
+  - 但并没有真正支持“带 cache 的变长 q_len 混合 prefill”这类更复杂的语义
+- 结果是：
+  - 队列 trace 看起来正确
+  - 但 refill 那一轮之后旧样本生成开始漂移
+
+### 5.6 当前 refill 方案：rebuild-on-refill
+- 当前 refill 采用的是：
+  - 一旦 shrink 后要补新请求
+  - 就先把当前 `running` 集合连同新请求一起作为一个新的 batch
+  - 用完整 `token_ids` 历史整体重建 KV
+- 为此当前 step 语义被拆成三类：
+  - `prefill`
+  - `decode`
+  - `rebuild`
+- `rebuild` 的优点：
+  - 正确性清晰
+  - 不依赖当前 attention 去支持 mixed prefill
+  - 便于继续验证 refill 行为本身是否成立
+- `rebuild` 的缺点：
+  - 会重复计算 surviving running 的完整历史
+  - 不是最终的高性能 continuous batching 方案
+- 但它当前是一个非常合适的阶段性桥梁：
+  - 先把“会 refill 且结果正确”建立起来
+  - 后面再继续替换成更高性能的 prefill/decode 混合调度
+### 5.7 为什么这样设计
 - 这不是最终的高性能方案，但它有两个优点：
   - 保持 batch 张量规则，便于先验证正确性
   - 提前建立“每个 slot 有自己的有效上下文长度”这一关键语义
@@ -211,11 +245,11 @@
 - 通过 `cache_lens` 控制 decode 时每个样本可见的历史长度
 
 ### 6.2 当前限制
-虽然已经支持变长 batch，并且已经实现 shrinking-batch + KV compaction，但这仍是“正确性优先”的第一版：
+虽然已经支持变长 batch，并且已经实现 shrinking-batch + refillable shrinking-batch，但这仍是“正确性优先”的第一版：
 - 没有 packed / varlen kernel
 - 没有 page table
-- 还没有“空位补新请求”的 refill 逻辑
-- 还没有 prefill/decode 共存的正式调度
+- 当前 refill 仍依赖 `rebuild-on-refill`，不是高性能 mixed prefill
+- 还没有 prefill/decode 共存的正式高效调度
 
 这意味着：
 - 语义已经打通

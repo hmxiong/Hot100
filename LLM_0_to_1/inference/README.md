@@ -21,7 +21,8 @@ python compare_infer_paths.py --mode engine_batch --load_from /root/autodl-tmp/m
 
 python verify_generate_step.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 8 --num_prompts 4 --max_new_tokens 64 --temperature 0 --top_p 1.0 --repetition_penalty 1.0
 
-python verify_shrinking_batch.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 8 --num_prompts 4 --max_new_tokens 64 --per_prompt_max_new_tokens 4,8,16,32 --temperature 0 --top_p 1.0 --show_outputs 1
+python verify_refill_batch.py   --load_from /root/autodl-tmp/minimind/minimind-3   --device cuda   --max_batch_size 4   --num_prompts 6   --max_new_tokens 64   --per_prompt_max_new_tokens 128,128,128,128,128,128   --temperature 0   --top_p 1.0   --show_outputs 1
+python verify_refill_batch.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 4 --num_prompts 6 --max_new_tokens 64 --per_prompt_max_new_tokens 4,8,16,32,6,10 --temperature 0 --top_p 1.0 --show_outputs 1
 
 # shrinking-batch 验证
 
@@ -34,6 +35,11 @@ python verify_shrinking_batch.py --load_from /root/autodl-tmp/minimind/minimind-
     - 是否真的发生 `running N->N-1`
     - shrinking 后剩余样本是否仍然正确生成
     - 最终输出是否仍与 reference 对齐
+- `verify_refill_batch.py`
+  - 用于验证第一版 refillable shrinking-batch：
+    - `max_batch_size` 是否真的限制初始 running 集合
+    - shrink 后 waiting 请求是否真的补入空位
+    - refill 之后最终输出是否仍与 reference 对齐
 
 ## 为什么需要它们
 
@@ -44,8 +50,13 @@ python verify_shrinking_batch.py --load_from /root/autodl-tmp/minimind/minimind-
   - 但 shrinking 后 `check_kv_cache()` 因 batch size 不匹配而 reset 整批 KV
   - 导致剩余样本丢失历史上下文，生成开始漂移和重复
 - 现在已经通过 `KV compaction` 修复，因此这两个脚本同时承担：
+- 之后 refill 阶段又暴露出另一个关键问题：
+  - mixed prefill 在当前 attention 语义下不成立
+  - 因此当前 refill 采用的是 `rebuild-on-refill`
+- 现在这些脚本同时承担：
   - 正确性回归
   - shrinking 行为可视化
+  - refill 行为可视化
 
 ## 推荐命令
 
@@ -78,12 +89,32 @@ python verify_shrinking_batch.py \
   --show_outputs 1
 ```
 
+### 3. 验证 refillable shrinking-batch
+
+```bash
+python verify_refill_batch.py \
+  --load_from /root/autodl-tmp/minimind/minimind-3 \
+  --device cuda \
+  --max_batch_size 4 \
+  --num_prompts 6 \
+  --max_new_tokens 64 \
+  --per_prompt_max_new_tokens 4,8,16,32,6,10 \
+  --temperature 0 \
+  --top_p 1.0 \
+  --show_outputs 1
+```
+
 ## 当前结论
 
 - `generate_step()` 在 deterministic 场景下已经与 `engine.generate_batch()` 对齐。
 - shrinking-batch scheduler 已经生效，能稳定出现：
   - `running 4->3->2->1->0`
 - `KV compaction` 已经补齐，shrinking 后 surviving 样本的最终输出仍与 reference 完全一致。
+- refillable shrinking-batch 也已经生效，能稳定出现：
+  - 初始 `waiting 6->2`, `running 0->4`
+  - shrink 后 `admitted_now=[4]`
+  - 再次 shrink 后 `admitted_now=[5]`
+- 当前 refill 采用的是 `correctness-first rebuild-on-refill`，最终输出已与 reference 完全一致。
 
 # serving_benchmark.py
 

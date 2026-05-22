@@ -113,6 +113,39 @@
   - `refillable shrinking batch`
   - 再进一步才是真正更完整的 continuous batching
 
+### 5.5 当前 refillable shrinking-batch 的实际结论
+- 我们已经完成了第一版 refill：
+  - `max_batch_size` 真实受 `SchedulerConfig` 控制
+  - shrinking 后 waiting 请求可以补进空位
+  - 通过 `verify_refill_batch.py` 可以稳定看到：
+    - `step 0`: `waiting 6->2`, `running 0->4`
+    - `step 4`: `admitted_now=[4]`
+    - `step 8`: `admitted_now=[5]`
+    - `shrink_happened=True`
+    - `refill_happened=True`
+- 最终 6 条输出与 `reference engine.generate_batch` 完全一致
+
+### 5.6 在 refill 阶段踩到的新坑
+- 第一版 refill 曾尝试使用 mixed prefill：
+  - 旧 running 的 pending token
+  - 新 waiting 的完整 prompt
+  - 混在同一轮 step 中执行
+- 这在当前 attention 语义下不成立，导致：
+  - 队列 trace 正确
+  - 但 refill 后旧样本输出开始分叉
+- 因此当前我们明确了一个重要结论：
+  - 真正高性能的 mixed prefill / decode 共存调度，需要更成熟的 attention / runner 语义支持
+
+### 5.7 当前解决方案与后续方向
+- 当前采取的方案是：
+  - `correctness-first rebuild-on-refill`
+  - 即补位时先重建当前 running 集合的 KV，再继续 decode
+- 这不是最终高性能实现，但它已经让 refill 行为在当前工程里闭环。
+- 因此下一步更合理的顺序是：
+  - 先接受 `rebuild-on-refill` 作为正确性基线
+  - 再继续优化到真正的 mixed prefill / decode 调度
+  - 最后再考虑 chunked prefill、packed/varlen、paged/block KV
+
 ## 6. Chunked Prefill（把 prefill 也拆成 step）
 - 需求：长 prompt 会独占算力导致短请求排队；希望长 prompt 分块并与 decode 交织。
 - 原理：prefill 可按 token chunk 分段计算并增量写入 KV（注意：需要模型支持 cache + 位置编码一致）。
@@ -160,10 +193,11 @@
   - `engine.generate_batch` 与 `basic.generate` 在当前 8 条 prompt 测试集上输出对齐
   - `generate_step` 与 `engine.generate_batch` 在 deterministic 场景下输出对齐
   - shrinking-batch scheduler + KV compaction 已打通，并通过独立脚本验证
+  - refillable shrinking-batch 已打通，并通过独立脚本验证
 - 当前代表性结果：
   - `basic.generate`: `2022 tokens / 11.18s / 180.87 tokens/s`
   - `engine.generate_batch`: `2022 tokens / 3.89s / 519.31 tokens/s`
 - 现阶段主问题：
   - 单条 `engine.generate` 仍慢于 `basic.generate`
-  - 当前虽然已经支持 shrinking-batch，但还不能在运行中补入新请求
+  - 当前虽然已经支持 refill，但 refill 仍依赖 `rebuild-on-refill`
   - KV 仍是规则张量语义，离真正的专业 serving engine 还有调度与内存管理差距
