@@ -4,13 +4,25 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-
+from torch import nn
 
 @dataclass(slots=True)
 class SampleResult:
     token_id: int
     logprob: Optional[float] = None
 
+
+class Sampler(nn.Module):
+    @torch.compile
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        logits = logits.float()
+        greedy_mask = temperatures <= 0
+        safe_temperatures = torch.where(greedy_mask, torch.ones_like(temperatures), temperatures)
+        scaled_logits = logits / safe_temperatures.unsqueeze(dim=1)
+        probs = torch.softmax(scaled_logits, dim=-1)
+        sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
+        greedy_tokens = torch.argmax(logits, dim=-1)
+        return torch.where(greedy_mask, greedy_tokens, sample_tokens)
 
 def _apply_repetition_penalty(logits: torch.Tensor, generated_token_ids: list[int], penalty: float) -> torch.Tensor:
     if penalty is None or penalty == 1.0 or not generated_token_ids:
@@ -57,4 +69,3 @@ def sample_next_token(
 
     token_id = int(torch.multinomial(probs, num_samples=1, generator=generator).item())
     return SampleResult(token_id=token_id)
-

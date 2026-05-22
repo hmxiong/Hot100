@@ -145,6 +145,21 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.cache_lens = torch.tensor([], dtype=torch.long)
 
+    def compact_kv_cache(self, keep_indices: list[int] | torch.Tensor) -> None:
+        if self.k_cache.numel() == 0 or self.v_cache.numel() == 0:
+            return
+        if isinstance(keep_indices, torch.Tensor):
+            keep_tensor = keep_indices.to(device=self.k_cache.device, dtype=torch.long)
+        else:
+            keep_tensor = torch.tensor(list(keep_indices), device=self.k_cache.device, dtype=torch.long)
+        if keep_tensor.numel() == 0:
+            self.reset_kv_cache()
+            return
+        self.k_cache = self.k_cache.index_select(0, keep_tensor).contiguous()
+        self.v_cache = self.v_cache.index_select(0, keep_tensor).contiguous()
+        cache_keep = keep_tensor.to(device=self.cache_lens.device)
+        self.cache_lens = self.cache_lens.index_select(0, cache_keep).contiguous()
+
     def check_kv_cache(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> bool:
         if self.k_cache.numel() == 0 or self.v_cache.numel() == 0:
             return False
@@ -356,6 +371,10 @@ class MiniMindModel(nn.Module):
         for layer in self.layers:
             layer.self_attn.reset_kv_cache()
 
+    def compact_kv_cache(self, keep_indices: list[int] | torch.Tensor) -> None:
+        for layer in self.layers:
+            layer.self_attn.compact_kv_cache(keep_indices)
+
 class MiniMindForCausalLM(nn.Module):
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -405,6 +424,9 @@ class MiniMindForCausalLM(nn.Module):
 
     def reset_kv_cache(self) -> None:
         self.model.reset_kv_cache()
+
+    def compact_kv_cache(self, keep_indices: list[int] | torch.Tensor) -> None:
+        self.model.compact_kv_cache(keep_indices)
 
     @classmethod
     def from_pretrained(

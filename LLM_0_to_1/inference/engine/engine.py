@@ -4,12 +4,13 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Optional
-
 import torch
 
 from .kv_cache import KVCache, KVCacheView, NaiveKVCache
 from .request import GenerationParams, Request, RequestStatus
 from .sampler import sample_next_token
+from .scheduler import SimpleScheduler, Sequence
+from .model_runner import SimpleModelRunner
 
 
 @dataclass(slots=True)
@@ -34,7 +35,6 @@ class _BatchGenerateState:
     eos_hit: torch.Tensor
     generated_token_ids: list[list[int]]
 
-
 class InferenceEngine:
     def __init__(
         self,
@@ -48,7 +48,8 @@ class InferenceEngine:
         self.config = config
         self.kv_cache = kv_cache or NaiveKVCache()
 
-        # self.sampler = 
+        self.scheduler = SimpleScheduler()
+        self.model_runner = SimpleModelRunner(model)
 
         self._waiting: list[Request] = []
         self._running: list[Request] = []
@@ -186,6 +187,71 @@ class InferenceEngine:
             logits_last = self.model.decode(next_token, positions=step_positions, active_mask=active_mask)
         
         return generated
+    
+    def add_request(self, prompt: str | list[int], sampling_params: GenerationParams):
+        apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
+        if callable(apply_chat_template):
+            conv = [{"role": "user", "content": prompt}]
+            prompt = apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+
+        input_ids = self.tokenizer.encode(prompt)
+        seq = Sequence(input_ids, sampling_params)
+        self.scheduler.add(seq)
+    
+    def is_finished(self):
+        return self.scheduler.is_finished()
+
+    def _compact_model_kv_cache_for_running(self, seqs: list[Sequence]) -> None:
+        compact_fn = getattr(self.model, "compact_kv_cache", None)
+        if not callable(compact_fn):
+            return
+        running_ids = [seq.seq_id for seq in self.scheduler.running]
+        if not running_ids:
+            reset_fn = getattr(self.model, "reset_kv_cache", None)
+            if callable(reset_fn):
+                reset_fn()
+            return
+        id_to_old_index = {seq.seq_id: idx for idx, seq in enumerate(seqs)}
+        keep_indices = [id_to_old_index[seq_id] for seq_id in running_ids if seq_id in id_to_old_index]
+        compact_fn(keep_indices)
+    
+    def step(self):
+        # 单个step需要检测batch队列中所有序列的状态，并根据状态决定处于running还是waiting
+        seqs, is_prefill = self.scheduler.schedule()
+        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        token_ids = self.model_runner.run(seqs, is_prefill)
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if (not is_prefill) and seqs:
+            self._compact_model_kv_cache_for_running(seqs)
+
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        return outputs, num_tokens
+
+    def generate_step(
+            self,
+            prompts: list[str] | list[list[int]],
+            sampling_params: GenerationParams | list[GenerationParams],
+        ) -> torch.Tensor:
+
+        if hasattr(self.model, "reset_kv_cache"):
+            self.model.reset_kv_cache()
+
+        for prompt, sp in zip(prompts, sampling_params):
+            self.add_request(prompt, sp)
+
+        outputs = {}
+        
+        while not self.is_finished():
+            t = time.perf_counter()
+            output, num_tokens = self.step()
+
+            for seq_id, token_ids in output:
+                outputs[seq_id] = token_ids
+
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        return outputs
+
 
     @torch.inference_mode()
     def generate(

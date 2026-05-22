@@ -411,7 +411,7 @@ def _run_engine_continuous(
         now = time.time()
         t = now - start_wall
         while next_idx < len(prompts) and arrivals[next_idx] <= t:
-            rid = engine.add_request(prompts[next_idx], params=params, is_pretrain=use_pretrain_prompt)
+            rid = engine.add_request(prompts[next_idx], params=params)
             request_ids.append(rid)
             request_to_idx[rid] = next_idx
             arrival_wall[rid] = start_wall + arrivals[next_idx]

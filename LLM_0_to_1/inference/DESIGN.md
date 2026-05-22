@@ -60,6 +60,12 @@
   - 组织采样
   - 处理 eos / finished / 生成长度
   - 管理 batch 语义下的 decode 循环
+- 当前还新增了一条 step-based 路径：
+  - `generate_step()`
+  - `step()`
+  - `SimpleScheduler`
+  - `SimpleModelRunner`
+- 这条路径的作用不是替代现有 `generate_batch()`，而是作为 shrinking batch / continuous batching 的实验场。
 - 当前公开的生成接口：
   - `generate()`：单条或 `B=1` 路径
   - `generate_batch()`：batch 路径
@@ -160,7 +166,29 @@
 - 如果样本仍活跃：
   - 追加当前 step 的真实 KV
 
-### 5.3 为什么这样设计
+### 5.3 shrinking-batch 过程中暴露出的关键问题
+- 当引入 `generate_step() + SimpleScheduler` 后，系统第一次出现了“running batch 真正缩小”的情况：
+  - `running 4->3->2->1`
+- 早期实现虽然调度器已经移除了 finished 样本，但模型内部 KV 仍保持旧 batch row 布局。
+- 这会触发一个隐藏问题：
+  - 下一轮 decode 时，`check_kv_cache()` 发现当前 batch size 与旧 cache 的 batch 维不一致
+  - 整批 KV cache 被 reset
+  - decode 只喂最后 1 个 token，但历史上下文已经丢失
+  - 最终表现为 shrinking 后剩余样本生成开始漂移、重复或退化
+
+### 5.4 当前修复方案：KV compaction
+- 当前已经在 `model_infer.py` 中新增 `compact_kv_cache()`：
+  - `Attention.compact_kv_cache()`
+  - `MiniMindModel.compact_kv_cache()`
+  - `MiniMindForCausalLM.compact_kv_cache()`
+- 在 `engine.step()` 的 decode 后：
+  - 如果 `running` 集合发生收缩
+  - 就按 surviving rows 的顺序压缩 `k_cache / v_cache / cache_lens`
+- 这样下一轮 shrinking 后的 decode 仍能继续使用正确历史。
+- 这一步的意义是：
+  - 让“调度层删除样本”和“模型层保留剩余样本历史”第一次真正闭环
+
+### 5.5 为什么这样设计
 - 这不是最终的高性能方案，但它有两个优点：
   - 保持 batch 张量规则，便于先验证正确性
   - 提前建立“每个 slot 有自己的有效上下文长度”这一关键语义
@@ -183,11 +211,11 @@
 - 通过 `cache_lens` 控制 decode 时每个样本可见的历史长度
 
 ### 6.2 当前限制
-虽然已经支持变长 batch，但这仍是“正确性优先”的第一版：
+虽然已经支持变长 batch，并且已经实现 shrinking-batch + KV compaction，但这仍是“正确性优先”的第一版：
 - 没有 packed / varlen kernel
 - 没有 page table
-- 没有动态压缩活跃样本
-- finished 样本仍保留在 batch 中
+- 还没有“空位补新请求”的 refill 逻辑
+- 还没有 prefill/decode 共存的正式调度
 
 这意味着：
 - 语义已经打通
@@ -222,13 +250,14 @@
 - 接下来更关注的能力包括：
   - request 生命周期管理
   - scheduler 驱动的动态活跃集合
+  - shrinking 后的空位补新请求
   - prefill/decode 资源分治
   - KV 生命周期外提
   - 稳定的吞吐/延迟/显存观测
 ## 10. 当前设计的刻意限制
 - 当前重点仍是“教学可控、路径清晰”，不是“一步到位复刻 vLLM”。
 - 当前 KV 还在模型内部维护，没有完全外提到独立的 cache manager。
-- 当前 decode 仍保持固定 batch slot，不做活跃样本压缩。
+- 当前已经支持 shrinking-batch，但 KV 仍然是规则张量语义，没有演进到 slot/block/page table。
 - 当前 attention 仍使用 PyTorch 的常规路径，没有引入专用 varlen/paged kernel。
 
 这些限制都是刻意保留的，因为它们让每一步重构都更容易验证和对照。

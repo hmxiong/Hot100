@@ -19,6 +19,72 @@ python compare_infer_paths.py --mode engine --load_from /root/autodl-tmp/minimin
 
 python compare_infer_paths.py --mode engine_batch --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_new_tokens 256 --temperature 0 --use_chat_template 1 --show_outputs 0 --num_prompts 8
 
+python verify_generate_step.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 8 --num_prompts 4 --max_new_tokens 64 --temperature 0 --top_p 1.0 --repetition_penalty 1.0
+
+python verify_shrinking_batch.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 8 --num_prompts 4 --max_new_tokens 64 --per_prompt_max_new_tokens 4,8,16,32 --temperature 0 --top_p 1.0 --show_outputs 1
+
+# shrinking-batch 验证
+
+## 作用
+
+- `verify_generate_step.py`
+  - 用于验证 `generate_step()` 这条 step-based 路径是否和当前稳定的 `engine.generate_batch()` 对齐。
+- `verify_shrinking_batch.py`
+  - 用于专门验证 shrinking-batch scheduler：
+    - 是否真的发生 `running N->N-1`
+    - shrinking 后剩余样本是否仍然正确生成
+    - 最终输出是否仍与 reference 对齐
+
+## 为什么需要它们
+
+- 从 dynamic batch 走到 shrinking-batch 的过程中，最关键的新问题不是“调度器会不会删样本”，而是：
+  - 样本删掉之后，模型内部 KV cache 是否也跟着 batch row 一起重排
+- 这一步曾经暴露出一个关键 bug：
+  - 调度 trace 已经显示 `running 4->3->2->1`
+  - 但 shrinking 后 `check_kv_cache()` 因 batch size 不匹配而 reset 整批 KV
+  - 导致剩余样本丢失历史上下文，生成开始漂移和重复
+- 现在已经通过 `KV compaction` 修复，因此这两个脚本同时承担：
+  - 正确性回归
+  - shrinking 行为可视化
+
+## 推荐命令
+
+### 1. 验证 `generate_step` 输出是否正确
+
+```bash
+python verify_generate_step.py \
+  --load_from /root/autodl-tmp/minimind/minimind-3 \
+  --device cuda \
+  --max_batch_size 8 \
+  --num_prompts 4 \
+  --max_new_tokens 64 \
+  --temperature 0 \
+  --top_p 1.0 \
+  --repetition_penalty 1.0
+```
+
+### 2. 验证 shrinking-batch + KV compaction
+
+```bash
+python verify_shrinking_batch.py \
+  --load_from /root/autodl-tmp/minimind/minimind-3 \
+  --device cuda \
+  --max_batch_size 8 \
+  --num_prompts 4 \
+  --max_new_tokens 64 \
+  --per_prompt_max_new_tokens 4,8,16,32 \
+  --temperature 0 \
+  --top_p 1.0 \
+  --show_outputs 1
+```
+
+## 当前结论
+
+- `generate_step()` 在 deterministic 场景下已经与 `engine.generate_batch()` 对齐。
+- shrinking-batch scheduler 已经生效，能稳定出现：
+  - `running 4->3->2->1->0`
+- `KV compaction` 已经补齐，shrinking 后 surviving 样本的最终输出仍与 reference 完全一致。
+
 # serving_benchmark.py
 
 ## 作用

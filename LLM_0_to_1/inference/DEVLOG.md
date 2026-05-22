@@ -140,3 +140,85 @@
   - 后续工作重点不再是“为什么生成不一致”，而是：
     - 为什么单条 `engine.generate` 仍慢于 `basic.generate`
     - 如何把当前静态 batch 优势扩展到更专业的 serving engine 能力
+
+## 2026-05-21
+### 新增：`generate_step` 最小闭环，打通 step-based 调度路径
+- 改动
+  - 基于当前 `InferenceEngine / SimpleScheduler / SimpleModelRunner`，补齐：
+    - `prepare_prefill()`
+    - `prepare_decode()`
+    - `run_model()` 的 `prefill/decode` 两条分支
+    - `scheduler.postprocess()`
+    - `engine.generate_step()`
+  - `Sampler` 增加 `temperature <= 0` 时的 greedy 路径，避免除零和采样异常。
+- 动机
+  - 后续要从静态 batch 走向 shrinking batch / continuous batching，必须先把“逐 step 运行 + 每步调度 + 每步回写状态”这条路径独立出来。
+  - 这一步的目标不是性能，而是先把调度和模型执行拆开，建立最小可验证闭环。
+- 验证
+  - `verify_generate_step.py` 在 `temperature=0`、4 条 prompt、`max_new_tokens=64` 下验证：
+    - `generate_step` 可完整跑通
+    - 最终输出与 `reference engine.generate_batch` 完全一致
+
+### 新增：shrinking-batch 验证脚本，专门观察 batch 收缩行为
+- 改动
+  - 新增 `verify_shrinking_batch.py`：
+    - 逐 step 打印 `waiting/running/finished` 变化
+    - 支持 `--per_prompt_max_new_tokens`
+    - 打印最终文本输出与 `token_ids`
+    - 最后对齐 `reference engine.generate_batch`
+- 动机
+  - 仅验证 `generate_step` 最终输出还不够，必须显式观察：
+    - 哪个 step 开始有样本完成
+    - `running` 是否真的从 `N -> N-1`
+    - shrinking 后剩余样本是否仍然正确推进
+- 验证
+  - 通过 `--per_prompt_max_new_tokens 4,8,16,32` 稳定制造 `running 4->3->2->1->0` 的收缩过程
+
+### 定位问题：shrinking 生效了，但 batch 收缩后输出开始分叉
+- 现象
+  - `verify_shrinking_batch.py` 的第一次运行中：
+    - trace 已经显示 `running 4->3->2->1`
+    - 但最终第 1 条样本从第 5 个 token 开始与 reference 分叉
+    - 后续样本出现明显重复生成，如 `jjjjj`、`使用使用使用...`
+- 诊断结论
+  - 调度器本身没有问题，`finished` 样本确实被从 `running` 中移除了。
+  - 真正的问题在模型内部 KV：
+    - batch 收缩后，模型各层的 `k_cache/v_cache/cache_lens` 仍保留旧 batch row 布局
+    - 下一轮 decode 时 `check_kv_cache()` 发现 `batch_size` 不匹配，直接 `reset_kv_cache()`
+    - 之后 decode 只喂最后 1 个 token，但历史 KV 已丢失，导致生成轨迹漂移
+- 含义
+  - 这一步非常关键：它说明 shrinking-batch 的第一类核心问题不是“调度怎么删样本”，而是“删完样本后，模型内部状态怎么跟着一起重排”
+
+### 修复：增加 KV compaction，让 shrinking-batch 闭环
+- 改动
+  - 在 `model_infer.py` 中新增：
+    - `Attention.compact_kv_cache()`
+    - `MiniMindModel.compact_kv_cache()`
+    - `MiniMindForCausalLM.compact_kv_cache()`
+  - 在 `engine.step()` 中新增：
+    - decode 后根据当前 surviving `running` 顺序，对模型内部 KV cache 做 compact
+- 动机
+  - shrinking 后剩余样本必须继承原来的历史 KV，不能因为 batch 维度变化而整批 reset。
+  - 这是从“固定 batch slot + inactive mask”走向“真实 shrinking batch”必须补上的那一步。
+- 验证
+  - 重新运行：
+    - `python verify_shrinking_batch.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 8 --num_prompts 4 --max_new_tokens 64 --per_prompt_max_new_tokens 4,8,16,32 --temperature 0 --top_p 1.0 --show_outputs 1`
+  - 结果显示：
+    - `shrink_happened=True`
+    - trace 中稳定出现 `running 4->3->2->1->0`
+    - 最终 4 条输出全部与 `reference engine.generate_batch` 完全一致
+
+### 阶段性结论：从 dynamic batch 正式迈到 shrinking-batch scheduler
+- 当前状态
+  - 我们不再只是“支持 batch 内不同样本独立 finished”
+  - 而是已经实现：
+    - step-based `generate_step`
+    - shrinking-batch scheduler
+    - KV compaction
+    - shrinking 过程的可观测验证脚本
+- 含义
+  - 这说明当前系统已经跨过了“静态 batch + 冻结 inactive slot”的阶段。
+  - 下一阶段的重点可以顺理成章转向：
+    - 空位补新请求
+    - prefill/decode 共存调度
+    - 真正的 continuous batching

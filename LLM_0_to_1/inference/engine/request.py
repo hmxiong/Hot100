@@ -23,6 +23,8 @@ class GenerationParams:
     repetition_penalty: float = 1.0
     eos_token_id: Optional[int] = None
     pad_token_id: Optional[int] = None
+    ignore_eos: bool = False
+
 
 
 @dataclass(slots=True)

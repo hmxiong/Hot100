@@ -76,6 +76,43 @@
   - 预留：prefill 与 decode 分别调度（为 chunked prefill 做铺垫）。
 - 验证：压测脚本（固定 prompt 长度/不同到达率），输出吞吐与 P50/P99 延迟。
 
+### 5.1 当前已完成的前置里程碑
+- 我们已经从“dynamic batch inference”继续推进到：
+  - `generate_step()` 最小闭环
+  - shrinking-batch scheduler
+  - KV compaction
+- 这一步的核心收获不是性能，而是验证了一件事：
+  - running batch 可以在 decode 过程中真实收缩
+  - shrinking 后 surviving 请求的历史 KV 可以被正确保留
+
+### 5.2 这一步中实际踩到的问题
+- 第一个版本的 shrinking-batch 虽然在调度器层面已经实现：
+  - finished 样本会从 `running` 中移除
+  - trace 中已经出现 `running 4->3->2->1`
+- 但最终输出会分叉，原因不是调度器，而是模型内部 KV：
+  - batch 收缩后，旧的 `k_cache/v_cache/cache_lens` 仍按旧 row 布局保存
+  - 下一轮 decode 时 `check_kv_cache()` 因 batch size 不匹配而整批 reset cache
+  - 剩余样本丢失历史上下文，生成开始退化和重复
+
+### 5.3 当前解决方案
+- 在 `model_infer.py` 中新增 `compact_kv_cache()`
+- 在 `engine.step()` 中在 decode 后按 surviving `running` 顺序执行 KV compaction
+- 验证结果：
+  - `verify_shrinking_batch.py --per_prompt_max_new_tokens 4,8,16,32`
+  - 能稳定看到 `running 4->3->2->1->0`
+  - 最终输出与 `reference engine.generate_batch` 完全一致
+
+### 5.4 因此下一步应是什么
+- 当前最自然的下一步不再是“是否能 shrink”
+- 而是：
+  - shrinking 后是否能把 waiting 请求补进空位
+  - prefill 新请求与 decode 旧请求如何共存调度
+- 换句话说，下一步已经从：
+  - `shrinking batch`
+  进入：
+  - `refillable shrinking batch`
+  - 再进一步才是真正更完整的 continuous batching
+
 ## 6. Chunked Prefill（把 prefill 也拆成 step）
 - 需求：长 prompt 会独占算力导致短请求排队；希望长 prompt 分块并与 decode 交织。
 - 原理：prefill 可按 token chunk 分段计算并增量写入 KV（注意：需要模型支持 cache + 位置编码一致）。
@@ -121,9 +158,12 @@
   - `model_infer` 与 `model.py` 前向对齐
   - `engine.generate` 与 `basic.generate` 输出对齐
   - `engine.generate_batch` 与 `basic.generate` 在当前 8 条 prompt 测试集上输出对齐
+  - `generate_step` 与 `engine.generate_batch` 在 deterministic 场景下输出对齐
+  - shrinking-batch scheduler + KV compaction 已打通，并通过独立脚本验证
 - 当前代表性结果：
   - `basic.generate`: `2022 tokens / 11.18s / 180.87 tokens/s`
   - `engine.generate_batch`: `2022 tokens / 3.89s / 519.31 tokens/s`
 - 现阶段主问题：
   - 单条 `engine.generate` 仍慢于 `basic.generate`
-  - 当前 batch 能力仍是“静态 batch + 规则张量 KV”，离真正的专业 serving engine 还有调度与内存管理差距
+  - 当前虽然已经支持 shrinking-batch，但还不能在运行中补入新请求
+  - KV 仍是规则张量语义，离真正的专业 serving engine 还有调度与内存管理差距
