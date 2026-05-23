@@ -22,7 +22,7 @@ python compare_infer_paths.py --mode engine_batch --load_from /root/autodl-tmp/m
 python verify_generate_step.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 8 --num_prompts 4 --max_new_tokens 64 --temperature 0 --top_p 1.0 --repetition_penalty 1.0
 
 python verify_refill_batch.py   --load_from /root/autodl-tmp/minimind/minimind-3   --device cuda   --max_batch_size 4   --num_prompts 6   --max_new_tokens 64   --per_prompt_max_new_tokens 128,128,128,128,128,128   --temperature 0   --top_p 1.0   --show_outputs 1
-python verify_refill_batch.py --load_from /root/autodl-tmp/minimind/minimind-3 --device cuda --max_batch_size 4 --num_prompts 6 --max_new_tokens 64 --per_prompt_max_new_tokens 4,8,16,32,6,10 --temperature 0 --top_p 1.0 --show_outputs 1
+
 
 # shrinking-batch 验证
 
